@@ -46,7 +46,106 @@ func (t TransactionSorter) Less(i, j int) bool {
 }
 ```
 
-### 2. ブロック生成ロジックの改善
+### 2. 状態コピー機能
+```go
+func (c *Chain) copyState() map[string]Account {
+    copy := make(map[string]Account, len(c.State))
+    for k, v := range c.State {
+        copy[k] = v
+    }
+    return copy
+}
+
+func (c *Chain) applyTransactionToState(state map[string]Account, tx Transaction) error {
+    from := state[tx.From]
+    if from.Address == "" {
+        return errors.New("from account does not exist")
+    }
+    
+    // nonceチェック
+    if tx.Nonce != from.Nonce {
+        return fmt.Errorf("bad nonce: got %d, want %d", tx.Nonce, from.Nonce)
+    }
+    
+    // 残高チェック
+    if from.Balance < tx.Value {
+        return errors.New("insufficient balance")
+    }
+    
+    // 状態更新
+    to := state[tx.To]
+    if to.Address == "" {
+        to = Account{
+            Address: tx.To,
+            Balance: 0,
+            Nonce:   0,
+        }
+    }
+    
+    from.Balance -= tx.Value
+    from.Nonce++
+    to.Balance += tx.Value
+    
+    state[from.Address] = from
+    state[to.Address] = to
+    
+    return nil
+}
+```
+
+### 3. トランザクションソートと選別ロジック
+```go
+// 適用可能なトランザクションを選別
+func (c *Chain) selectApplicableTransactions(state map[string]Account, txs []Transaction) []Transaction {
+    sort.Sort(TransactionSorter(txs))
+    
+    var applicable []Transaction
+    processedNonces := make(map[string]uint64) // from -> next nonce
+    
+    for _, tx := range txs {
+        from := state[tx.From]
+        if from.Address == "" {
+            continue // 送信元アカウントが存在しない
+        }
+        
+        expectedNonce := processedNonces[tx.From]
+        if tx.Nonce != expectedNonce {
+            continue // nonceが期待値と異なる
+        }
+        
+        // 残高チェック
+        if from.Balance < tx.Value {
+            continue // 残高不足
+        }
+        
+        // このトランザクションは適用可能
+        applicable = append(applicable, tx)
+        
+        // 状態を更新して次のトランザクションチェックに備える
+        from.Balance -= tx.Value
+        from.Nonce++
+        state[tx.From] = from
+        
+        // 宛先アカウントを準備
+        to := state[tx.To]
+        if to.Address == "" {
+            to = Account{
+                Address: tx.To,
+                Balance: 0,
+                Nonce:   0,
+            }
+        }
+        to.Balance += tx.Value
+        state[tx.To] = to
+        
+        processedNonces[tx.From] = expectedNonce + 1
+    }
+    
+    return applicable
+}
+```
+
+### 4. ブロック生成ロジックの改善
 ```go
 func (c *Chain) mineBlock() (*Block, error) {
     c.mu.Lock()

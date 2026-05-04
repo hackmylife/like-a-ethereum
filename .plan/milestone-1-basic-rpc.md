@@ -33,6 +33,76 @@
 2. `State[address].Nonce` をhex quantityで返す
 3. 存在しないアカウントは `0x0` を返す
 
+#### 具体的な実装コード
+
+**main.go に追加するdispatchケース:**
+```go
+case "eth_getTransactionCount":
+    addr, err := parseGetTransactionCountParams(params)
+    if err != nil {
+        return nil, rpcInvalidParams(err)
+    }
+
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    acct := c.State[addr]
+    if acct.Address == "" {
+        return toHex(uint64(0)), nil
+    }
+    return toHex(acct.Nonce), nil
+```
+
+**rpc.go に追加するパラメータ解析関数:**
+```go
+func parseGetTransactionCountParams(params json.RawMessage) (string, error) {
+    var arr []json.RawMessage
+
+    if err := json.Unmarshal(params, &arr); err != nil || len(arr) < 1 {
+        return "", errors.New("eth_getTransactionCount expects [address, blockTag]")
+    }
+
+    var addr string
+    if err := json.Unmarshal(arr[0], &addr); err != nil {
+        return "", err
+    }
+
+    return normalizeAddress(addr)
+}
+```
+
+**Chain構造体にTxIndexを追加:**
+```go
+type Chain struct {
+    mu         sync.Mutex
+    State      map[string]Account
+    Blocks     []Block
+    TxIndex    map[string]TxLocation  // 追加
+    BlockIndex map[string]uint64      // 追加
+}
+
+type TxLocation struct {
+    BlockNumber uint64
+    TxIndex     int
+}
+```
+
+**トランザクション追加時にインデックスを更新:**
+```go
+func (c *Chain) addTransaction(tx Transaction) (map[string]any, error) {
+    // ... 既存の検証と処理 ...
+    
+    // ブロック生成後にインデックスを更新
+    blockHash := block.Hash
+    c.TxIndex[tx.Hash] = TxLocation{
+        BlockNumber: block.Number,
+        TxIndex:     0, // 1トランザクションなので0
+    }
+    
+    return receipt, nil
+}
+```
+
 ### テストケース
 - Genesis直後のAlice nonceが `0x0`
 - 1回送金後のAlice nonceが `0x1`

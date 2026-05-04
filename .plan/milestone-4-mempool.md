@@ -32,6 +32,110 @@ type Mempool struct {
     Transactions  []Transaction
     TxIndex       map[string]int // hash -> index
 }
+
+// コンストラクタ
+func NewMempool() *Mempool {
+    return &Mempool{
+        Transactions: make([]Transaction, 0),
+        TxIndex:      make(map[string]int),
+    }
+}
+
+// トランザクションを追加
+func (m *Mempool) Add(tx Transaction) error {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    
+    // 重複チェック
+    if _, exists := m.TxIndex[tx.Hash]; exists {
+        return errors.New("transaction already exists in mempool")
+    }
+    
+    // 検証
+    if err := m.validateTransaction(tx); err != nil {
+        return err
+    }
+    
+    // 追加
+    m.Transactions = append(m.Transactions, tx)
+    m.TxIndex[tx.Hash] = len(m.Transactions) - 1
+    
+    return nil
+}
+
+// トランザクションを取り出す
+func (m *Mempool) Take(count int) []Transaction {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    
+    if len(m.Transactions) == 0 {
+        return nil
+    }
+    
+    if count > len(m.Transactions) {
+        count = len(m.Transactions)
+    }
+    
+    taken := make([]Transaction, count)
+    copy(taken, m.Transactions[:count])
+    
+    // 残りのトランザクションを前に詰める
+    m.Transactions = m.Transactions[count:]
+    m.rebuildIndex()
+    
+    return taken
+}
+
+// すべてのトランザクションを取得
+func (m *Mempool) GetAll() []Transaction {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    
+    result := make([]Transaction, len(m.Transactions))
+    copy(result, m.Transactions)
+    return result
+}
+
+// クリア
+func (m *Mempool) Clear() {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    
+    m.Transactions = make([]Transaction, 0)
+    m.TxIndex = make(map[string]int)
+}
+
+// 重複チェック
+func (m *Mempool) Exists(hash string) bool {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    
+    _, exists := m.TxIndex[hash]
+    return exists
+}
+
+// インデックス再構築
+func (m *Mempool) rebuildIndex() {
+    m.TxIndex = make(map[string]int)
+    for i, tx := range m.Transactions {
+        m.TxIndex[tx.Hash] = i
+    }
+}
+
+// トランザクション検証
+func (m *Mempool) validateTransaction(tx Transaction) error {
+    // 基本的な形式チェック
+    if tx.From == "" || tx.To == "" {
+        return errors.New("invalid from/to address")
+    }
+    
+    if tx.Value == 0 {
+        return errors.New("zero value transaction")
+    }
+    
+    // 署名検証はChainレベルで行う
+    return nil
+}
 ```
 
 ### Chain構造体の変更

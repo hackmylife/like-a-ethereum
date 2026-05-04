@@ -94,6 +94,142 @@ func CalculateHash(block Block) string {
     sum := sha256.Sum256(jsonData)
     return "0x" + hex.EncodeToString(sum[:])
 }
+
+func getTxHashes(txs []Transaction) []string {
+    hashes := make([]string, len(txs))
+    for i, tx := range txs {
+        hashes[i] = tx.Hash
+    }
+    return hashes
+}
+```
+
+### 2. マイニング実装の詳細
+```go
+// 基本的なマイニング（シングルスレッド）
+func MineBlock(block Block, maxAttempts uint64) (Block, error) {
+    for nonce := uint64(0); nonce < maxAttempts; nonce++ {
+        block.Nonce = nonce
+        block.Hash = CalculateHash(block)
+        
+        if IsValidProof(block.Hash, block.Difficulty) {
+            return block, nil
+        }
+        
+        // 進捗表示（オプション）
+        if nonce%100000 == 0 && nonce > 0 {
+            fmt.Printf("Mining attempt %d...\n", nonce)
+        }
+    }
+    
+    return Block{}, errors.New("failed to find valid proof")
+}
+
+// 並列マイニング（複数のgoroutineを使用）
+func MineBlockParallel(block Block, maxAttempts, workers uint64) (Block, error) {
+    type result struct {
+        block Block
+        err   error
+    }
+    
+    results := make(chan result, 1)
+    attemptsPerWorker := maxAttempts / workers
+    
+    // ワーカーを起動
+    for i := uint64(0); i < workers; i++ {
+        go func(startNonce uint64) {
+            localBlock := block
+            endNonce := startNonce + attemptsPerWorker
+            
+            for nonce := startNonce; nonce < endNonce; nonce++ {
+                localBlock.Nonce = nonce
+                localBlock.Hash = CalculateHash(localBlock)
+                
+                if IsValidProof(localBlock.Hash, localBlock.Difficulty) {
+                    select {
+                    case results <- result{block: localBlock}:
+                    default:
+                    }
+                    return
+                }
+            }
+            
+            // このワーカーは見つからなかった
+            select {
+            case results <- result{err: errors.New("not found")}:
+            default:
+            }
+        }(i * attemptsPerWorker)
+    }
+    
+    // 最初の成功を待機
+    for i := uint64(0); i < workers; i++ {
+        res := <-results
+        if res.err == nil {
+            return res.block, nil
+        }
+    }
+    
+    return Block{}, errors.New("failed to find valid proof")
+}
+
+// 難易度計算のヘルパー関数
+func CalculateDifficulty(currentDifficulty uint64, blockTime int64, targetTime int64) uint64 {
+    if blockTime < targetTime/2 {
+        // ブロック生成が速すぎる：難易度を上げる
+        return currentDifficulty + 1
+    } else if blockTime > targetTime*2 {
+        // ブロック生成が遅すぎる：難易度を下げる
+        if currentDifficulty > 1 {
+            return currentDifficulty - 1
+        }
+        return 1
+    }
+    
+    // 適切な時間：難易度を維持
+    return currentDifficulty
+}
+
+// マイニング統計情報
+type MiningStats struct {
+    Attempts      uint64
+    HashRate      float64 // hashes per second
+    Difficulty    uint64
+    BlockFound    bool
+    TimeTaken     time.Duration
+}
+
+func MineBlockWithStats(block Block, maxAttempts uint64) (Block, MiningStats, error) {
+    startTime := time.Now()
+    stats := MiningStats{
+        Difficulty: block.Difficulty,
+    }
+    
+    for nonce := uint64(0); nonce < maxAttempts; nonce++ {
+        block.Nonce = nonce
+        block.Hash = CalculateHash(block)
+        
+        stats.Attempts++
+        
+        if IsValidProof(block.Hash, block.Difficulty) {
+            stats.TimeTaken = time.Since(startTime)
+            stats.HashRate = float64(stats.Attempts) / stats.TimeTaken.Seconds()
+            stats.BlockFound = true
+            return block, stats, nil
+        }
+        
+        // 1秒ごとに統計を更新
+        if nonce%1000000 == 0 && nonce > 0 {
+            elapsed := time.Since(startTime)
+            stats.HashRate = float64(nonce) / elapsed.Seconds()
+            fmt.Printf("Hash rate: %.2f H/s, Attempts: %d\n", stats.HashRate, nonce)
+        }
+    }
+    
+    stats.TimeTaken = time.Since(startTime)
+    stats.HashRate = float64(stats.Attempts) / stats.TimeTaken.Seconds()
+    return Block{}, stats, errors.New("failed to find valid proof")
+}
 ```
 
 ### 2. マイニングロジック

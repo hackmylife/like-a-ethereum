@@ -32,7 +32,12 @@ type Contract interface {
 package contract
 
 import (
+    "crypto/sha256"
+    "encoding/hex"
     "encoding/json"
+    "errors"
+    "fmt"
+    "strconv"
     "sync"
 )
 
@@ -102,6 +107,383 @@ func GetContract(state *State, address string) (Contract, error) {
     }
     
     return constructor(), nil
+}
+
+func generateContractAddress() string {
+    // 簡易的なアドレス生成（実際はもっと複雑）
+    random := fmt.Sprintf("%d", time.Now().UnixNano())
+    hash := sha256.Sum256([]byte(random))
+    return "0x" + hex.EncodeToString(hash[:20])
+}
+
+// コントラクト呼び出しのヘルパー関数
+func CallContract(state *State, from, to string, input []byte, isTransaction bool) ([]byte, error) {
+    contract, err := GetContract(state, to)
+    if err != nil {
+        return nil, err
+    }
+    
+    // コントラクトの状態を設定（リフレクションまたは埋め込み）
+    if c, ok := contract.(interface{ setState(*State) }); ok {
+        c.setState(state)
+    }
+    
+    result, err := contract.Call(state, input)
+    if err != nil {
+        return nil, err
+    }
+    
+    // トランザクションの場合はnonceを増やす
+    if isTransaction {
+        account := state.Accounts[from]
+        account.Nonce++
+        state.Accounts[from] = account
+    }
+    
+    return result, nil
+}
+```
+
+### 2. Counterコントラクトの完全な実装
+```go
+type Counter struct {
+    state *State
+    addr  string
+}
+
+func NewCounter() Contract {
+    return &Counter{}
+}
+
+func (c *Counter) setState(state *State) {
+    c.state = state
+}
+
+func (c *Counter) Call(state *State, input []byte) ([]byte, error) {
+    c.state = state
+    
+    // inputをパースしてメソッドを特定
+    var callData struct {
+        Method string `json:"method"`
+        Value  uint64 `json:"value,omitempty"`
+    }
+    
+    if err := json.Unmarshal(input, &callData); err != nil {
+        return nil, err
+    }
+    
+    switch callData.Method {
+    case "get":
+        return c.get()
+    case "increment":
+        return c.increment(callData.Value)
+    case "decrement":
+        return c.decrement(callData.Value)
+    case "reset":
+        return c.reset()
+    default:
+        return nil, errors.New("unknown method")
+    }
+}
+
+func (c *Counter) GetStorage(key string) (string, error) {
+    if c.state == nil {
+        return "", errors.New("state not set")
+    }
+    
+    c.state.mu.RLock()
+    defer c.state.mu.RUnlock()
+    
+    contract := c.state.Contracts[c.addr]
+    return contract.Storage[key], nil
+}
+
+func (c *Counter) SetStorage(key, value string) error {
+    if c.state == nil {
+        return errors.New("state not set")
+    }
+    
+    c.state.mu.Lock()
+    defer c.state.mu.Unlock()
+    
+    contract := c.state.Contracts[c.addr]
+    contract.Storage[key] = value
+    c.state.Contracts[c.addr] = contract
+    return nil
+}
+
+func (c *Counter) get() ([]byte, error) {
+    countStr, err := c.GetStorage("count")
+    if err != nil {
+        return nil, err
+    }
+    
+    var count uint64
+    if countStr != "" {
+        count, _ = strconv.ParseUint(countStr, 10, 64)
+    }
+    
+    result := map[string]any{
+        "count": count,
+        "method": "get",
+    }
+    return json.Marshal(result)
+}
+
+func (c *Counter) increment(value uint64) ([]byte, error) {
+    countStr, err := c.GetStorage("count")
+    if err != nil {
+        return nil, err
+    }
+    
+    var count uint64
+    if countStr != "" {
+        count, _ = strconv.ParseUint(countStr, 10, 64)
+    }
+    
+    count += value
+    if err := c.SetStorage("count", strconv.FormatUint(count, 10)); err != nil {
+        return nil, err
+    }
+    
+    // 履歴を保存（オプション）
+    history := fmt.Sprintf("%d->%d", count-value, count)
+    c.SetStorage("last_increment", history)
+    
+    result := map[string]any{
+        "count": count,
+        "incremented": value,
+        "method": "increment",
+    }
+    return json.Marshal(result)
+}
+
+func (c *Counter) decrement(value uint64) ([]byte, error) {
+    countStr, err := c.GetStorage("count")
+    if err != nil {
+        return nil, err
+    }
+    
+    var count uint64
+    if countStr != "" {
+        count, _ = strconv.ParseUint(countStr, 10, 64)
+    }
+    
+    if count < value {
+        return nil, errors.New("underflow: cannot decrement below zero")
+    }
+    
+    count -= value
+    if err := c.SetStorage("count", strconv.FormatUint(count, 10)); err != nil {
+        return nil, err
+    }
+    
+    result := map[string]any{
+        "count": count,
+        "decremented": value,
+        "method": "decrement",
+    }
+    return json.Marshal(result)
+}
+
+func (c *Counter) reset() ([]byte, error) {
+    if err := c.SetStorage("count", "0"); err != nil {
+        return nil, err
+    }
+    
+    result := map[string]any{
+        "count": 0,
+        "method": "reset",
+    }
+    return json.Marshal(result)
+}
+```
+
+### 3. SimpleTokenコントラクトの完全な実装
+```go
+type SimpleToken struct {
+    state *State
+    addr  string
+}
+
+func NewSimpleToken() Contract {
+    return &SimpleToken{}
+}
+
+func (st *SimpleToken) setState(state *State) {
+    st.state = state
+}
+
+func (st *SimpleToken) Call(state *State, input []byte) ([]byte, error) {
+    st.state = state
+    
+    var callData struct {
+        Method     string `json:"method"`
+        From       string `json:"from,omitempty"`
+        To         string `json:"to,omitempty"`
+        Amount     uint64 `json:"amount,omitempty"`
+        Name       string `json:"name,omitempty"`
+        Symbol     string `json:"symbol,omitempty"`
+        TotalSupply uint64 `json:"totalSupply,omitempty"`
+    }
+    
+    if err := json.Unmarshal(input, &callData); err != nil {
+        return nil, err
+    }
+    
+    switch callData.Method {
+    case "init":
+        return st.init(callData.Name, callData.Symbol, callData.TotalSupply)
+    case "balanceOf":
+        return st.balanceOf(callData.From)
+    case "transfer":
+        return st.transfer(callData.From, callData.To, callData.Amount)
+    case "approve":
+        return st.approve(callData.From, callData.To, callData.Amount)
+    case "totalSupply":
+        return st.totalSupply()
+    case "allowance":
+        return st.allowance(callData.From, callData.To)
+    default:
+        return nil, errors.New("unknown method")
+    }
+}
+
+func (st *SimpleToken) GetStorage(key string) (string, error) {
+    st.state.mu.RLock()
+    defer st.state.mu.RUnlock()
+    
+    contract := st.state.Contracts[st.addr]
+    return contract.Storage[key], nil
+}
+
+func (st *SimpleToken) SetStorage(key, value string) error {
+    st.state.mu.Lock()
+    defer st.state.mu.Unlock()
+    
+    contract := st.state.Contracts[st.addr]
+    contract.Storage[key] = value
+    st.state.Contracts[st.addr] = contract
+    return nil
+}
+
+func (st *SimpleToken) init(name, symbol string, totalSupply uint64) ([]byte, error) {
+    if err := st.SetStorage("name", name); err != nil {
+        return nil, err
+    }
+    
+    if err := st.SetStorage("symbol", symbol); err != nil {
+        return nil, err
+    }
+    
+    if err := st.SetStorage("totalSupply", strconv.FormatUint(totalSupply, 10)); err != nil {
+        return nil, err
+    }
+    
+    // デプロイアドレスに全供給量を割り当て
+    deployerAddr := "0xdeployer" // 実際はデプロイしたアドレス
+    if err := st.SetStorage("balance:"+deployerAddr, strconv.FormatUint(totalSupply, 10)); err != nil {
+        return nil, err
+    }
+    
+    result := map[string]any{
+        "name": name,
+        "symbol": symbol,
+        "totalSupply": totalSupply,
+        "deployer": deployerAddr,
+        "method": "init",
+    }
+    return json.Marshal(result)
+}
+
+func (st *SimpleToken) balanceOf(account string) ([]byte, error) {
+    balanceStr, err := st.GetStorage("balance:" + account)
+    if err != nil {
+        return nil, err
+    }
+    
+    var balance uint64
+    if balanceStr != "" {
+        balance, _ = strconv.ParseUint(balanceStr, 10, 64)
+    }
+    
+    result := map[string]any{
+        "account": account,
+        "balance": balance,
+        "method": "balanceOf",
+    }
+    return json.Marshal(result)
+}
+
+func (st *SimpleToken) transfer(from, to string, amount uint64) ([]byte, error) {
+    // fromの残高を取得
+    fromBalanceStr, err := st.GetStorage("balance:" + from)
+    if err != nil {
+        return nil, err
+    }
+    
+    var fromBalance uint64
+    if fromBalanceStr != "" {
+        fromBalance, _ = strconv.ParseUint(fromBalanceStr, 10, 64)
+    }
+    
+    if fromBalance < amount {
+        return nil, errors.New("insufficient balance")
+    }
+    
+    // 残高を更新
+    fromBalance -= amount
+    if err := st.SetStorage("balance:" + from, strconv.FormatUint(fromBalance, 10)); err != nil {
+        return nil, err
+    }
+    
+    // toの残高を取得・更新
+    toBalanceStr, err := st.GetStorage("balance:" + to)
+    if err != nil {
+        return nil, err
+    }
+    
+    var toBalance uint64
+    if toBalanceStr != "" {
+        toBalance, _ = strconv.ParseUint(toBalanceStr, 10, 64)
+    }
+    
+    toBalance += amount
+    if err := st.SetStorage("balance:" + to, strconv.FormatUint(toBalance, 10)); err != nil {
+        return nil, err
+    }
+    
+    // 転送イベントを記録（簡易版）
+    event := fmt.Sprintf("%s->%s:%d", from, to, amount)
+    st.SetStorage("last_transfer", event)
+    
+    result := map[string]any{
+        "from": from,
+        "to": to,
+        "amount": amount,
+        "fromBalance": fromBalance,
+        "toBalance": toBalance,
+        "method": "transfer",
+    }
+    return json.Marshal(result)
+}
+
+func (st *SimpleToken) totalSupply() ([]byte, error) {
+    totalStr, err := st.GetStorage("totalSupply")
+    if err != nil {
+        return nil, err
+    }
+    
+    var total uint64
+    if totalStr != "" {
+        total, _ = strconv.ParseUint(totalStr, 10, 64)
+    }
+    
+    result := map[string]any{
+        "totalSupply": total,
+        "method": "totalSupply",
+    }
+    return json.Marshal(result)
 }
 ```
 
