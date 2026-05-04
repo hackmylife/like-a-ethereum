@@ -1,192 +1,703 @@
-# Notion × Claude × GitHub Codegen Workflow
+# mini-eth-node
 
-> Notion のチケット本文（**toggle「[AI] Spec」配下**）を Claude に渡してコードを生成し、指定の GitHub リポジトリに **ブランチ作成 → 新規ファイル追加 → commit/push → PR 作成** まで自動化します。  
-> ブランチ名は **`feature/[unique_id]_AI_Generated`**（Notion の `unique_id` プロパティを使用）。
+Goで実装する、学習用の「ミニEthereum風ノード」です。
 
----
+Ethereum互換ノードではありません。アカウント、残高、nonce、署名付きトランザクション、ブロック、簡易stateRoot、JSON-RPCを小さく実装して、ブロックチェーンの基本概念を理解するための教材です。
 
-## 目次
-- [概要](#概要)
-- [要件 / 前提](#要件--前提)
-- [セットアップ](#セットアップ)
-- [Notion 側の準備](#notion-側の準備)
-- [環境変数](#環境変数)
-- [使い方](#使い方)
-  - [ローカル（Dry-run）](#ローカルdry-run)
-  - [ローカル（実PR作成）](#ローカル実pr作成)
-  - [GitHub Actions から再利用](#github-actions-から再利用)
-- [ブランチ / ファイル命名](#ブランチ--ファイル命名)
-- [仕組み](#仕組み)
-- [トラブルシュート](#トラブルシュート)
-- [セキュリティ注意点](#セキュリティ注意点)
-- [今後の拡張（Step2 以降）](#今後の拡張step2-以降)
+## 目的
 
----
+この実装で学ぶこと:
 
-## 概要
-このリポジトリは以下を自動で行います。
+- アカウントベースの状態管理
+- トランザクションによる状態遷移
+- 署名検証
+- nonceによるリプレイ防止
+- ブロック生成
+- stateRoot風ハッシュ
+- JSON-RPC API
 
-1. **Notion**: Database から **タグ**でチケットを1件取得（プロパティ `ID` は `unique_id` 型を想定）  
-   - ページ本文から **toggle リスト「[AI] Spec」** の**子ブロックのみ**抽出
-2. **Claude**: 抽出要件をもとに **純コードのみ**を生成（説明なし／コードフェンス必須）
-3. **GitHub**: `feature/[unique_id]_AI_Generated` でブランチ作成  
-   `generated/` 以下にファイル追加 → commit/push → **PR 作成**
+## 実装している機能
 
-> ※ 既存コードを参照して差分編集する機能は **Step2** として今後追加予定。
+### アカウント
 
----
+```go
+type Account struct {
+    Address string
+    Balance uint64
+    Nonce   uint64
+}
+```
 
-## 要件 / 前提
-- Node.js **v20 以上**（`--import tsx` を使用）
-- Notion Integration（対象 Database に **Connection** で権限付与）
-- Anthropic **Claude API Key**
-- GitHub **Personal Access Token**（`repo` 権限）— 他リポに push/PR する場合に使用
+### トランザクション
 
----
+```go
+type Transaction struct {
+    From      string
+    To        string
+    Value     uint64
+    Nonce     uint64
+    PubKey    string
+    Signature string
+    Hash      string
+}
+```
+
+### ブロック
+
+```go
+type Block struct {
+    Number       uint64
+    ParentHash   string
+    Timestamp    int64
+    Transactions []Transaction
+    StateRoot    string
+    Hash         string
+}
+```
+
+### JSON-RPC
+
+| メソッド | 説明 |
+|---|---|
+| `eth_blockNumber` | 最新ブロック番号を返す |
+| `eth_getBalance` | 指定アドレスの残高を返す |
+| `sendTransaction` | 署名済みトランザクションを送信する |
+| `eth_getBlockByNumber` | 指定番号のブロックを返す |
+
+## Ethereumとの違い
+
+| 項目 | Ethereum | この実装 |
+|---|---|---|
+| 署名方式 | secp256k1 | Ed25519 |
+| ハッシュ | Keccak-256 | SHA-256 |
+| stateRoot | Merkle Patricia Trie | ソート済みアカウント一覧のSHA-256 |
+| トランザクション形式 | RLP / Typed Transaction | JSON |
+| ブロック生成 | PoS / Consensus | `sendTransaction`時に即ブロック生成 |
+| 送信RPC | `eth_sendRawTransaction` | 独自 `sendTransaction` |
+| P2P | あり | なし |
+| EVM | あり | なし |
+| Gas | あり | なし |
+
+## 必要環境
+
+- Go 1.22以上推奨
+- curl
+- jq 任意
 
 ## セットアップ
 
 ```bash
-# 依存のインストール
-npm ci
-
-# .env を作成（Secrets は本番では GitHub Secrets を利用）
-cp .env.example .env
+mkdir mini-eth-node
+cd mini-eth-node
+go mod init mini-eth-node
 ```
 
-`.env` の主要項目は後述の「環境変数」を参照してください。
+`main.go` を配置します。
 
----
-
-## Notion 側の準備
-1. **Integration を作成**し、対象 Database の右上 **Share → Connections** で当該 Integration を追加  
-2. **Database ID** を URL から取得  
-   - 例: `https://www.notion.so/workspace/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?v=...`  
-     → `xxxxxxxx...` が Database ID（ハイフンありでも可）
-3. **タグプロパティ**（multi_select / select / status のいずれか）を用意（例: `タグ`）  
-   - 生成対象のページに **指定タグ**（例: `ready-for-ai`）を付与
-4. ページ本文に **toggle リスト**を作り、**タイトルを `[AI] Spec`** にする  
-   - その**子ブロック**に AI に渡したい仕様を書く
-5. `unique_id` タイプのプロパティ（例: 名前 `ID`）で **連番などのユニーク値**を持たせる  
-   - これをブランチ名に使用します
-
----
-
-## 環境変数
-
-`.env` または GitHub Secrets に設定します。
-
-| 変数名 | 必須 | 説明 | 例 |
-|---|:--:|---|---|
-| `NOTION_API_KEY` | ✅ | Notion Integration のシークレット | `secret_xxx` |
-| `NOTION_DATABASE_ID` | ✅ | 対象 Database ID | `xxxxxxxx...` |
-| `NOTION_TAG_PROP` |  | 抽出に使うタグのプロパティ名 | `タグ` / `Tags` |
-| `NOTION_TAG` | ✅ | 抽出タグの値 | `ready-for-ai` |
-| `NOTION_UNIQUE_ID_PROP` |  | `unique_id` 型の列名 | `ID` |
-| `CLAUDE_API_KEY` | ✅ | Anthropic Claude API Key | `sk-ant-...` |
-| `MODEL` |  | Claude モデル | `claude-3-5-sonnet-20240620` |
-| `MAX_TOKENS` |  | 生成最大トークン（**整数**） | `800` |
-| `LANG_HINT` |  | 生成言語ヒント | `typescript` / `python` |
-| `TARGET_REPO` | ✅ | push 先リポ（`org/repo`） | `your-org/target-repo` |
-| `BASE_BRANCH` |  | ベースブランチ | `main` |
-| `FILE_EXT` |  | 出力拡張子 | `ts` |
-| `CODE_PATH` |  | 出力パス | `generated` |
-| `GH_PAT` | ✅ | GitHub PAT（`repo` 権限） | `ghp_xxx` |
-| `DRY_RUN` |  | `1` で push/PR をスキップ | `1` |
-| `USE_MOCK` |  | `1` で Claude をモック | `1` |
-| `MAX_DESC_LEN` |  | Notion 本文の最大文字数 | `8000` |
-| `AI_TOGGLE_TITLE` |  | toggle タイトル | `[AI] Spec` |
-
-> **注意**: `MAX_TOKENS` は **整数**で設定し、API キーは `CLAUDE_API_KEY` に入れてください。
-
----
-
-## 使い方
-
-### ローカル（Dry-run）
 ```bash
-export NOTION_TAG="ready-for-ai"
-export CLAUDE_API_KEY=sk-ant-xxxx
-export GH_PAT=ghp_xxxx
-export TARGET_REPO=your-org/sandbox-repo
-export DRY_RUN=1
-
-node --import tsx action-src/tools/run_codegen.ts
+go build
 ```
-- `payload.json` が生成され、branch/file/PR のプランがログ出力されます。
 
-### ローカル（実PR作成）
+ビルドに成功すれば準備完了です。
+
+## コマンド
+
 ```bash
-export DRY_RUN=0
-node --import tsx action-src/tools/run_codegen.ts
-```
-- `feature/[unique_id]_AI_Generated` ブランチが作成され、コードファイルが追加され、PRが作成されます。
-
-### GitHub Actions から再利用
-呼び出し元リポジトリにワークフローを定義して利用可能です。
-
-```yaml
-name: Generate Code from Notion
-on:
-  workflow_dispatch:
-jobs:
-  codegen:
-    uses: your-org/notion-codegen-workflows/.github/workflows/codegen.yml@v0.2.0
-    with:
-      notion_tag: "ready-for-ai"
-      target_repo: "your-org/target-repo"
-      file_ext: "ts"
-      dry_run: "false"
-    secrets:
-      NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
-      NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-      CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
-      TARGET_REPO_TOKEN: ${{ secrets.GH_PAT }}
+go run . account
+go run . sign --priv <privateKeyHex> --to <address> --value <amount> --nonce <nonce>
+go run . node --genesis genesis.json --addr :8545
 ```
 
----
+## クイックスタート
 
-## ブランチ / ファイル命名
-- **ブランチ**: `feature/[unique_id]_AI_Generated`  
-  - `unique_id` は Notion の `unique_id` プロパティの値（数値）を文字列化して使用
-  - 許容外文字はサニタイズ（空白→`-` など）
-- **ファイル**: `generated/[unique_id].<ext>`（`ext` は `FILE_EXT`）
+### 1. Aliceアカウントを作成
 
----
+```bash
+go run . account
+```
 
-## 仕組み
-- `action-src/services/notion.ts`  
-  - タグでページ1件抽出（プロパティ型に応じて `multi_select/select/status` を自動判定）  
-  - 本文ブロックを再帰取得し、**toggle「[AI] Spec」配下のみ**を Markdown に整形  
-  - プロパティ `ID`（`unique_id` 型）を読み取り、`uniqueId` として返却
-- `action-src/services/claude.ts`  
-  - 出力は**コードのみ**になるよう厳格にプロンプト化  
-  - 返答から **コードフェンス（```）または `<CODE>` タグ**を抽出し、純コードを返す
-- `action-src/services/github.ts`  
-  - `feature/[unique_id]_AI_Generated` ブランチを作成  
-  - `generated/[unique_id].<ext>` を追加して commit/push  
-  - PR を作成（Notion へのリンク・抽出スコープを本文に記載）
+出力例:
 
----
+```json
+{
+  "address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "privateKey": "0x...",
+  "publicKey": "0x..."
+}
+```
 
-## トラブルシュート
-- **invalid x-api-key (401)**: `CLAUDE_API_KEY` が誤り／期限切れ。`sk-ant-` から始まるキーを設定。  
-- **max_tokens エラー (400)**: `MAX_TOKENS` は **整数**で指定。  
-- **validation_error: property type mismatch**: Notion のプロパティ型とフィルタが不一致。`print_db_schema` ツールで型を確認。  
-- **ブランチ衝突**: 既存ブランチがある場合はタイムスタンプを付けて回避。  
-- **ファイル重複**: 既存を上書きしない安全運用（エラー）にしています。必要ならポリシー変更可。
+以下の値を控えます。
 
----
+```bash
+ALICE_ADDRESS=0x...
+ALICE_PRIVATE_KEY=0x...
+ALICE_PUBLIC_KEY=0x...
+```
 
-## セキュリティ注意点
-- API キー（`CLAUDE_API_KEY`/`NOTION_API_KEY`/`GH_PAT`）は **.env をコミットしない**。GitHub Secrets を使用。  
-- 生成コードは**必ずレビュー**（権限・外部通信・ライセンス等）。  
-- PAT は最小権限・短期有効期限を推奨。
+### 2. Bobアカウントを作成
 
----
+```bash
+go run . account
+```
 
-## 今後の拡張（Step2 以降）
-- 既存コードの参照と**差分編集（パッチ適用）**  
-- 生成後の **lint / tsc / unit test** を PR に自動レポート  
-- 複数ファイル生成（`<!-- BEGIN CODEFILE:path -->` 形式）への拡張  
-- 失敗時の通知（Slack / GitHub コメント）
+以下の値を控えます。
+
+```bash
+BOB_ADDRESS=0x...
+BOB_PRIVATE_KEY=0x...
+BOB_PUBLIC_KEY=0x...
+```
+
+### 3. genesis.jsonを作成
+
+Aliceに初期残高1000、Bobに0を割り当てます。
+
+```json
+{
+  "alloc": {
+    "0xAliceのaddress": 1000,
+    "0xBobのaddress": 0
+  }
+}
+```
+
+例:
+
+```bash
+cat > genesis.json <<'JSON'
+{
+  "alloc": {
+    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": 1000,
+    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": 0
+  }
+}
+JSON
+```
+
+実際には、上記のアドレスを自分が生成したAlice/Bobのアドレスに置き換えてください。
+
+### 4. ノードを起動
+
+```bash
+go run . node --genesis genesis.json --addr :8545
+```
+
+ログ例:
+
+```text
+mini ethereum-like node listening on :8545
+genesis block hash: 0x... stateRoot: 0x...
+```
+
+以降の手順は別ターミナルで実行します。
+
+## JSON-RPCの使い方
+
+### eth_blockNumber
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "eth_blockNumber",
+    "params": [],
+    "id": 1
+  }'
+```
+
+初期状態ではGenesisブロックのみなので、期待結果は `0x0` です。
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": "0x0",
+  "id": 1
+}
+```
+
+### eth_getBalance
+
+Aliceの残高を確認します。
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "eth_getBalance",
+    "params": ["0xAliceのaddress", "latest"],
+    "id": 2
+  }'
+```
+
+Aliceの初期残高が1000の場合、1000は16進数で `0x3e8` です。
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": "0x3e8",
+  "id": 2
+}
+```
+
+## 送金手順
+
+### 1. AliceからBobへのトランザクションを署名
+
+AliceからBobに150送ります。
+
+```bash
+go run . sign \
+  --priv 0xAliceのprivateKey \
+  --to 0xBobのaddress \
+  --value 150 \
+  --nonce 0
+```
+
+出力例:
+
+```json
+{
+  "from": "0xAliceのaddress",
+  "to": "0xBobのaddress",
+  "value": 150,
+  "nonce": 0,
+  "pubKey": "0x...",
+  "signature": "0x...",
+  "hash": "0x..."
+}
+```
+
+このJSONを `tx.json` として保存します。
+
+### 2. sendTransaction
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "sendTransaction",
+    "params": [
+      {
+        "from": "0xAliceのaddress",
+        "to": "0xBobのaddress",
+        "value": 150,
+        "nonce": 0,
+        "pubKey": "0x...",
+        "signature": "0x..."
+      }
+    ],
+    "id": 3
+  }'
+```
+
+成功すると、ブロックが1つ生成されます。
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "blockHash": "0x...",
+    "blockNumber": "0x1",
+    "stateRoot": "0x...",
+    "transactionHash": "0x..."
+  },
+  "id": 3
+}
+```
+
+状態は以下のように変わります。
+
+```text
+Alice balance: 1000 -> 850
+Alice nonce:   0    -> 1
+
+Bob balance:   0    -> 150
+Bob nonce:     0    -> 0
+
+blockNumber:   0    -> 1
+```
+
+### 3. Aliceの残高を確認
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "eth_getBalance",
+    "params": ["0xAliceのaddress", "latest"],
+    "id": 4
+  }'
+```
+
+期待結果:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": "0x352",
+  "id": 4
+}
+```
+
+`0x352` は10進数で850です。
+
+### 4. Bobの残高を確認
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "eth_getBalance",
+    "params": ["0xBobのaddress", "latest"],
+    "id": 5
+  }'
+```
+
+期待結果:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": "0x96",
+  "id": 5
+}
+```
+
+`0x96` は10進数で150です。
+
+### 5. 最新ブロックを確認
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "eth_getBlockByNumber",
+    "params": ["latest", true],
+    "id": 6
+  }'
+```
+
+期待結果の例:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "hash": "0x...",
+    "number": "0x1",
+    "parentHash": "0x...",
+    "stateRoot": "0x...",
+    "timestamp": "0x...",
+    "transactions": [
+      {
+        "from": "0xAliceのaddress",
+        "to": "0xBobのaddress",
+        "value": 150,
+        "nonce": 0,
+        "pubKey": "0x...",
+        "signature": "0x...",
+        "hash": "0x..."
+      }
+    ]
+  },
+  "id": 6
+}
+```
+
+## テスト手順
+
+この節では、実装が正しく動作しているかを手動テストします。
+
+### テスト1: ビルドできること
+
+```bash
+go build
+```
+
+期待結果:
+
+```text
+エラーなし
+```
+
+### テスト2: アカウントを生成できること
+
+```bash
+go run . account
+```
+
+期待結果:
+
+- `address` が `0x` から始まる
+- `address` が20 bytes、つまり40 hex charsである
+- `publicKey` が出力される
+- `privateKey` が出力される
+
+例:
+
+```json
+{
+  "address": "0x...",
+  "publicKey": "0x...",
+  "privateKey": "0x..."
+}
+```
+
+### テスト3: Genesisブロックが作られること
+
+1. `genesis.json` を作成します。
+2. ノードを起動します。
+
+```bash
+go run . node --genesis genesis.json --addr :8545
+```
+
+3. ブロック番号を確認します。
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+```
+
+期待結果:
+
+```json
+{"jsonrpc":"2.0","result":"0x0","id":1}
+```
+
+### テスト4: Genesis残高を取得できること
+
+AliceのGenesis残高を1000にしている場合:
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"eth_getBalance","params":["0xAliceのaddress","latest"],"id":2}'
+```
+
+期待結果:
+
+```json
+{"jsonrpc":"2.0","result":"0x3e8","id":2}
+```
+
+### テスト5: 署名済みトランザクションを作成できること
+
+```bash
+go run . sign \
+  --priv 0xAliceのprivateKey \
+  --to 0xBobのaddress \
+  --value 150 \
+  --nonce 0
+```
+
+期待結果:
+
+- `from` がAliceのaddressになる
+- `to` がBobのaddressになる
+- `value` が150になる
+- `nonce` が0になる
+- `signature` が出力される
+- `hash` が出力される
+
+### テスト6: sendTransactionでブロックが増えること
+
+署名済みトランザクションを `sendTransaction` します。
+
+期待結果:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "transactionHash": "0x...",
+    "blockNumber": "0x1",
+    "blockHash": "0x...",
+    "stateRoot": "0x..."
+  },
+  "id": 3
+}
+```
+
+続いてブロック番号を確認します。
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":4}'
+```
+
+期待結果:
+
+```json
+{"jsonrpc":"2.0","result":"0x1","id":4}
+```
+
+### テスト7: 残高が状態遷移していること
+
+Aliceの残高:
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"eth_getBalance","params":["0xAliceのaddress","latest"],"id":5}'
+```
+
+期待結果:
+
+```json
+{"jsonrpc":"2.0","result":"0x352","id":5}
+```
+
+Bobの残高:
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"eth_getBalance","params":["0xBobのaddress","latest"],"id":6}'
+```
+
+期待結果:
+
+```json
+{"jsonrpc":"2.0","result":"0x96","id":6}
+```
+
+### テスト8: 同じトランザクションを再送するとnonceエラーになること
+
+同じ署名済みトランザクションをもう一度 `sendTransaction` します。
+
+期待結果:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "error": {
+    "code": -32602,
+    "message": "bad nonce: got 0, want 1"
+  },
+  "id": 3
+}
+```
+
+これにより、nonceがリプレイ攻撃を防いでいることを確認できます。
+
+### テスト9: 残高不足の送金が失敗すること
+
+Aliceの残高以上の値を送金するトランザクションを作成します。
+
+```bash
+go run . sign \
+  --priv 0xAliceのprivateKey \
+  --to 0xBobのaddress \
+  --value 999999 \
+  --nonce 1
+```
+
+そのトランザクションを `sendTransaction` します。
+
+期待結果:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "error": {
+    "code": -32602,
+    "message": "insufficient balance"
+  },
+  "id": 7
+}
+```
+
+### テスト10: ブロック内容を取得できること
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x1",true],"id":8}'
+```
+
+期待結果:
+
+- `number` が `0x1`
+- `transactions` に送金トランザクションが入っている
+- `stateRoot` が入っている
+- `parentHash` がGenesisブロックのhashを指している
+
+## jqを使った確認例
+
+レスポンスを読みやすく表示したい場合:
+
+```bash
+curl -s -X POST localhost:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' | jq
+```
+
+## よくあるエラー
+
+### address must start with 0x
+
+アドレスが `0x` から始まっていません。
+
+### address must be 20 bytes / 40 hex chars
+
+アドレス長が不正です。
+
+### bad nonce
+
+送信したトランザクションのnonceが、現在のアカウントnonceと一致していません。
+
+現在の実装では `eth_getTransactionCount` が未実装なので、送信回数を手元で管理してください。
+
+### insufficient balance
+
+送金元の残高が不足しています。
+
+### invalid signature
+
+署名対象、秘密鍵、公開鍵、fromアドレスのいずれかが一致していません。
+
+## ディレクトリ構成
+
+現時点では学習しやすさを優先してフラットなファイル構成です。
+
+```text
+mini-eth-node/
+  go.mod
+  main.go
+  model.go
+  rpc.go
+  transaction.go
+  command.go
+  utils.go
+  genesis.json
+  README.md
+  PLAN.md
+```
+
+今後、機能が増えたら以下のように分割します。
+
+```text
+mini-eth-node/
+  cmd/
+  internal/
+    account/
+    block/
+    chain/
+    crypto/
+    rpc/
+    state/
+    tx/
+```
+
+## ライセンス
+
+学習用サンプルとして自由に利用してください。
