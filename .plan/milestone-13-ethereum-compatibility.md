@@ -30,14 +30,17 @@ package crypto
 
 import (
     "crypto/ecdsa"
-    "crypto/elliptic"
     "crypto/rand"
+    "encoding/hex"
+    gocrypto "github.com/ethereum/go-ethereum/crypto"       // Keccak256 等
     "github.com/ethereum/go-ethereum/crypto/secp256k1"
 )
 
-// 現在のEd25519からsecp256k1へ
+// 現在のEd25519からsecp256k1へ。
+// NOTE: elliptic.P256() は NIST P-256 曲線であり secp256k1 ではない。
+//       go-ethereum の GenerateKey() は内部で secp256k1 曲線を使用する。
 func GenerateSecp256k1Key() (*ecdsa.PrivateKey, error) {
-    return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+    return gocrypto.GenerateKey()
 }
 
 func SignTransactionSecp256k1(privKey *ecdsa.PrivateKey, hash []byte) ([]byte, error) {
@@ -45,12 +48,19 @@ func SignTransactionSecp256k1(privKey *ecdsa.PrivateKey, hash []byte) ([]byte, e
 }
 
 func VerifySecp256k1(pubKey *ecdsa.PublicKey, hash, signature []byte) bool {
-    return secp256k1.VerifySignature(pubKey, hash, signature)
+    return secp256k1.VerifySignature(ellipticMarshal(pubKey), hash, signature[:64])
+}
+
+// ellipticMarshal は公開鍵を非圧縮形式 (65 bytes) に変換する。
+func ellipticMarshal(pub *ecdsa.PublicKey) []byte {
+    return gocrypto.FromECDSAPub(pub)
 }
 
 // Address生成（Ethereum方式）
 func AddressFromSecp256k1Pubkey(pubKey *ecdsa.PublicKey) string {
-    pubBytes := crypto.Keccak256Hash(append(pubKey.X.Bytes(), pubKey.Y.Bytes()...))
+    // 非圧縮公開鍵の先頭 0x04 バイトを除いた 64 バイトの Keccak256 を計算し
+    // 後ろ 20 バイト (40 hex) を使う
+    pubBytes := gocrypto.Keccak256(ellipticMarshal(pubKey)[1:])
     return "0x" + hex.EncodeToString(pubBytes[12:]) // 後ろ20バイト
 }
 ```
@@ -60,12 +70,15 @@ func AddressFromSecp256k1Pubkey(pubKey *ecdsa.PublicKey) string {
 package crypto
 
 import (
-    "github.com/ethereum/go-ethereum/crypto"
+    "encoding/hex"
+    "encoding/json"
+    "strings"
+    gocrypto "github.com/ethereum/go-ethereum/crypto"
 )
 
 // SHA-256からKeccak-256へ
 func Keccak256Hash(data []byte) []byte {
-    return crypto.Keccak256Hash(data).Bytes()
+    return gocrypto.Keccak256Hash(data).Bytes()
 }
 
 func HashJSONKeccak(v any) string {
@@ -74,7 +87,7 @@ func HashJSONKeccak(v any) string {
         panic(err)
     }
     
-    hash := crypto.Keccak256Hash(b)
+    hash := gocrypto.Keccak256Hash(b)
     return "0x" + hex.EncodeToString(hash.Bytes())
 }
 
@@ -177,6 +190,50 @@ case "eth_sendRawTransaction":
     return map[string]any{
         "transactionHash": tx.Hash,
     }, nil
+```
+
+### 4b. verifyTransactionSignature の実装
+```go
+// verifyTransactionSignature は secp256k1 署名を検証し、送信元アドレスを確認する。
+// UseSecp256k1 が false の場合は既存の Ed25519 検証にフォールバックする。
+func (c *Chain) verifyTransactionSignature(tx Transaction) error {
+    if !UseSecp256k1 {
+        // 既存の検証ロジックへフォールバック
+        return validateTransaction(tx)
+    }
+    
+    // secp256k1 署名の場合：
+    // 1. トランザクションハッシュを計算
+    txHash := TxHashKeccak(tx)
+    hashBytes, err := hex.DecodeString(strings.TrimPrefix(txHash, "0x"))
+    if err != nil {
+        return fmt.Errorf("invalid tx hash: %w", err)
+    }
+    
+    // 2. 署名から公開鍵を復元
+    sigBytes, err := hex.DecodeString(strings.TrimPrefix(tx.Signature, "0x"))
+    if err != nil {
+        return fmt.Errorf("invalid signature: %w", err)
+    }
+    
+    pubKeyBytes, err := secp256k1.RecoverPubkey(hashBytes, sigBytes)
+    if err != nil {
+        return fmt.Errorf("failed to recover pubkey: %w", err)
+    }
+    
+    // 3. 公開鍵からアドレスを導出して一致を確認
+    pubKey, err := gocrypto.UnmarshalPubkey(pubKeyBytes)
+    if err != nil {
+        return fmt.Errorf("failed to unmarshal pubkey: %w", err)
+    }
+    
+    recoveredAddr := AddressFromSecp256k1Pubkey(pubKey)
+    if !strings.EqualFold(recoveredAddr, tx.From) {
+        return fmt.Errorf("signature mismatch: got %s, want %s", recoveredAddr, tx.From)
+    }
+    
+    return nil
+}
 ```
 
 ### 5. ChainIdの導入

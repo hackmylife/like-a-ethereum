@@ -185,43 +185,42 @@ type MerkleProof struct {
     Index  int
 }
 
-func (t *MerkleTree) GenerateProof(targetHash string) (*MerkkleProof, error) {
+func (t *MerkleTree) GenerateProof(targetHash string) (*MerkleProof, error) {
     // ターゲットのリーフノードを見つける
-    leafIndex, path := t.findPath(t.Root, targetHash, []string{})
+    leafIndex, path := t.findPath(t.Root, targetHash, []string{}, 0, 1)
     if leafIndex == -1 {
         return nil, errors.New("target not found")
     }
     
-    return &MerkkleProof{
+    return &MerkleProof{
         Hashes: path,
         Index:  leafIndex,
     }, nil
 }
 
-func (t *MerkleTree) findPath(node *MerkleNode, target string, path []string) (int, []string) {
+// findPath は再帰的にリーフを探索し、(リーフインデックス, siblingハッシュ列) を返す。
+// leafIndex はビットマスクとして VerifyProof に渡される（i ビット目が 0 なら左、1 なら右）。
+// depth は現在の深さ、bitPos はそのレベルでの右ビットの重み。
+func (t *MerkleTree) findPath(node *MerkleNode, target string, path []string, leafIndex int, bitPos int) (int, []string) {
     if node.Left == nil && node.Right == nil {
         // リーフノード
         if node.Hash == target {
-            return 0, path
+            return leafIndex, path
         }
         return -1, nil
     }
     
-    // 左側を探索
-    leftPath := append(path, node.Right.Hash)
-    leftIndex, leftResult := t.findPath(node.Left, target, leftPath)
+    // 左側を探索（右兄弟ハッシュを path に追加、ビットは立てない）
+    leftIndex, leftResult := t.findPath(node.Left, target,
+        append(path, node.Right.Hash), leafIndex, bitPos<<1)
     if leftIndex != -1 {
         return leftIndex, leftResult
     }
     
-    // 右側を探索
-    rightPath := append(path, node.Left.Hash)
-    rightIndex, rightResult := t.findPath(node.Right, target, rightPath)
-    if rightIndex != -1 {
-        return leftIndex + 1, rightResult // インデックスを調整
-    }
-    
-    return -1, nil
+    // 右側を探索（左兄弟ハッシュを path に追加、ビットを立てる）
+    rightIndex, rightResult := t.findPath(node.Right, target,
+        append(path, node.Left.Hash), leafIndex|bitPos, bitPos<<1)
+    return rightIndex, rightResult
 }
 
 func VerifyProof(rootHash, targetHash string, proof *MerkleProof) bool {

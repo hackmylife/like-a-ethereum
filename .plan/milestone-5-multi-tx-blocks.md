@@ -203,53 +203,6 @@ func (c *Chain) mineBlock() (*Block, error) {
 }
 ```
 
-### 3. 状態コピー機能
-```go
-func (c *Chain) copyState() map[string]Account {
-    copy := make(map[string]Account, len(c.State))
-    for k, v := range c.State {
-        copy[k] = v
-    }
-    return copy
-}
-
-func (c *Chain) applyTransactionToState(state map[string]Account, tx Transaction) error {
-    from := state[tx.From]
-    if from.Address == "" {
-        return errors.New("from account does not exist")
-    }
-    
-    // nonceチェック
-    if tx.Nonce != from.Nonce {
-        return fmt.Errorf("bad nonce: got %d, want %d", tx.Nonce, from.Nonce)
-    }
-    
-    // 残高チェック
-    if from.Balance < tx.Value {
-        return errors.New("insufficient balance")
-    }
-    
-    // 状態更新
-    to := state[tx.To]
-    if to.Address == "" {
-        to = Account{
-            Address: tx.To,
-            Balance: 0,
-            Nonce:   0,
-        }
-    }
-    
-    from.Balance -= tx.Value
-    from.Nonce++
-    to.Balance += tx.Value
-    
-    state[from.Address] = from
-    state[to.Address] = to
-    
-    return nil
-}
-```
-
 ### 4. Mempoolの改善
 ```go
 func (m *Mempool) Remove(hash string) bool {

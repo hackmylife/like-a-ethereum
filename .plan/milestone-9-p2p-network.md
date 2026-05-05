@@ -190,6 +190,28 @@ func (p *P2PManager) sendTransactionToPeer(address string, tx Transaction) error
     return nil
 }
 
+func (p *P2PManager) sendBlockToPeer(address string, block Block) error {
+    data := map[string]any{
+        "jsonrpc": "2.0",
+        "method":  "receiveBlock",
+        "params":  []any{block},
+        "id":      1,
+    }
+    
+    jsonData, _ := json.Marshal(data)
+    resp, err := p.client.Post(address+"/", "application/json", bytes.NewBuffer(jsonData))
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+    
+    if resp.StatusCode != http.StatusOK {
+        return fmt.Errorf("peer returned status: %d", resp.StatusCode)
+    }
+    
+    return nil
+}
+
 // ブロックのブロードキャスト
 func (p *P2PManager) BroadcastBlock(block Block) error {
     p.mu.RLock()

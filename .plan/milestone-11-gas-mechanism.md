@@ -154,7 +154,102 @@ func (c *Chain) distributeRewards(block *Block, totalGasFees uint64) error {
 }
 ```
 
-### 3. トランザクション処理の変更
+### 3. ヘルパー型・関数
+
+```go
+// TransactionSorter は GasPrice の高い順にトランザクションをソートする
+type TransactionSorter []Transaction
+
+func (s TransactionSorter) Len() int           { return len(s) }
+func (s TransactionSorter) Less(i, j int) bool { return s[i].GasPrice > s[j].GasPrice }
+func (s TransactionSorter) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
+// copyState は現在の c.State のシャローコピーを返す。
+func (c *Chain) copyState() map[string]Account {
+    copied := make(map[string]Account, len(c.State))
+    for k, v := range c.State {
+        copied[k] = v
+    }
+    return copied
+}
+
+// applyTransactionToStateWithGas は tempState に対してトランザクションをGas込みで適用する。
+func (c *Chain) applyTransactionToStateWithGas(state map[string]Account, tx Transaction) error {
+    from := state[tx.From]
+    if from.Address == "" {
+        return errors.New("from account does not exist")
+    }
+    
+    gasCalc := gas.NewGasCalculator()
+    if err := gasCalc.ValidateGas(tx, from.Balance); err != nil {
+        return err
+    }
+    
+    if tx.Nonce != from.Nonce {
+        return fmt.Errorf("bad nonce: got %d, want %d", tx.Nonce, from.Nonce)
+    }
+    
+    gasFee := gasCalc.CalculateFee(tx)
+    totalCost := tx.Value + gasFee
+    if from.Balance < totalCost {
+        return errors.New("insufficient balance")
+    }
+    
+    to := state[tx.To]
+    if to.Address == "" {
+        to = Account{Address: tx.To}
+    }
+    
+    from.Balance -= totalCost
+    from.Nonce++
+    to.Balance += tx.Value
+    
+    state[from.Address] = from
+    state[to.Address] = to
+    return nil
+}
+
+// calculateGasUsed はブロック内の全トランザクションの gasUsed 合計を返す。
+func (c *Chain) calculateGasUsed(block *Block) uint64 {
+    gasCalc := gas.NewGasCalculator()
+    var total uint64
+    for _, tx := range block.Transactions {
+        total += gasCalc.CalculateGasUsed(tx)
+    }
+    return total
+}
+
+// parseMineBlockParamsWithCoinbase は mineBlock RPC のパラメータ
+// {"difficulty": N, "coinbase": "0x..."} をパースする。
+func parseMineBlockParamsWithCoinbase(params json.RawMessage) (struct {
+    Difficulty uint64
+    Coinbase   string
+}, error) {
+    var result struct {
+        Difficulty uint64
+        Coinbase   string
+    }
+    
+    var arr []json.RawMessage
+    if err := json.Unmarshal(params, &arr); err != nil || len(arr) == 0 {
+        return result, errors.New("invalid params")
+    }
+    
+    var obj struct {
+        Difficulty uint64 `json:"difficulty"`
+        Coinbase   string `json:"coinbase"`
+    }
+    if err := json.Unmarshal(arr[0], &obj); err != nil {
+        return result, err
+    }
+    
+    result.Difficulty = obj.Difficulty
+    result.Coinbase = obj.Coinbase
+    return result, nil
+}
+```
+
+### 4. トランザクション処理の変更
 ```go
 func (c *Chain) applyTransactionWithGas(tx Transaction) error {
     from := c.State[tx.From]
@@ -296,8 +391,8 @@ case "sendTransaction":
         tx.GasPrice = 1e9 // 1 Gwei（デフォルト）
     }
     
-    // 署名とハッシュを再計算
-    if err := c.validateAndSignTransaction(&tx); err != nil {
+    // 署名・ハッシュを検証（既存の validateTransaction を使用）
+    if err := validateTransaction(tx); err != nil {
         return nil, rpcInvalidParams(err)
     }
     

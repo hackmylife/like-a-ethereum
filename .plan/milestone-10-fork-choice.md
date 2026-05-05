@@ -137,7 +137,9 @@ func (bt *BlockTree) GetCanonicalChain() []Block {
     return chain
 }
 
-func (bt *BlockTree) ReorgToNewHead() ([]Block, []Block) {
+// ReorgToNewHead は currentBlocks（現在の正史ブロック配列）を受け取り、
+// 新しい正史との差分として (削除すべき古いブロック, 追加すべき新しいブロック) を返す。
+func (bt *BlockTree) ReorgToNewHead(currentBlocks []Block) ([]Block, []Block) {
     // 新しい正史チェーンを取得
     newChain := bt.GetCanonicalChain()
     
@@ -147,8 +149,8 @@ func (bt *BlockTree) ReorgToNewHead() ([]Block, []Block) {
     var newBlocksToAdd []Block
     
     // 共通の祖先を見つける
-    for i := 0; i < len(newChain) && i < len(bt.blocks); i++ {
-        if newChain[i].Hash == bt.blocks[i].Hash {
+    for i := 0; i < len(newChain) && i < len(currentBlocks); i++ {
+        if newChain[i].Hash == currentBlocks[i].Hash {
             commonAncestor = &newChain[i]
         } else {
             break
@@ -157,7 +159,7 @@ func (bt *BlockTree) ReorgToNewHead() ([]Block, []Block) {
     
     if commonAncestor != nil {
         // 共通祖先以降の古いブロックを削除
-        for _, block := range bt.blocks {
+        for _, block := range currentBlocks {
             if block.Number > commonAncestor.Number {
                 oldBlocksToRemove = append(oldBlocksToRemove, block)
             }
@@ -177,16 +179,18 @@ func (bt *BlockTree) ReorgToNewHead() ([]Block, []Block) {
 
 ### 4. Chainへの統合
 ```go
+// Chain構造体に genesisPath と blockTree フィールドを追加する。
 type Chain struct {
-    mu         sync.Mutex
-    State      map[string]Account
-    Blocks     []Block
-    Mempool    *Mempool
-    TxIndex    map[string]TxLocation
-    BlockIndex map[string]uint64
+    mu          sync.Mutex
+    State       map[string]Account
+    Blocks      []Block
+    Mempool     *Mempool
+    TxIndex     map[string]TxLocation
+    BlockIndex  map[string]uint64
     persistence.Persistence
-    p2p        *p2p.P2PManager
-    blockTree  *BlockTree // 追加
+    p2p         *p2p.P2PManager
+    blockTree   *BlockTree // 追加
+    genesisPath string     // 追加：rollbackState でGenesis再ロードに使用
 }
 
 func (c *Chain) addBlockFromPeer(block Block) error {
@@ -208,7 +212,8 @@ func (c *Chain) addBlockFromPeer(block Block) error {
 }
 
 func (c *Chain) reorgToNewHead() error {
-    oldBlocks, newBlocks := c.blockTree.ReorgToNewHead()
+    // c.Blocks を渡して現在の正史との差分を計算
+    oldBlocks, newBlocks := c.blockTree.ReorgToNewHead(c.Blocks)
     
     // 状態をロールバック
     if err := c.rollbackState(oldBlocks); err != nil {
@@ -233,7 +238,7 @@ func (c *Chain) rollbackState(blocks []Block) error {
     // 簡易実装：Genesisから再計算
     // 本物ではより効率的なロールバックが必要
     
-    // Genesis状態にリセット
+    // Genesis状態にリセット（c.genesisPath は Chain 構造体のフィールド）
     genesis, err := NewChainFromGenesis(c.genesisPath)
     if err != nil {
         return err

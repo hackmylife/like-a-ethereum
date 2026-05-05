@@ -232,59 +232,6 @@ func MineBlockWithStats(block Block, maxAttempts uint64) (Block, MiningStats, er
 }
 ```
 
-### 2. マイニングロジック
-```go
-func MineBlock(block Block, maxAttempts uint64) (Block, error) {
-    for nonce := uint64(0); nonce < maxAttempts; nonce++ {
-        block.Nonce = nonce
-        block.Hash = CalculateHash(block)
-        
-        if IsValidProof(block.Hash, block.Difficulty) {
-            return block, nil
-        }
-    }
-    
-    return Block{}, errors.New("failed to find valid proof")
-}
-
-// 並列マイニング（オプション）
-func MineBlockParallel(block Block, maxAttempts, workers uint64) (Block, error) {
-    type result struct {
-        block Block
-        err   error
-    }
-    
-    results := make(chan result)
-    attemptsPerWorker := maxAttempts / workers
-    
-    for i := uint64(0); i < workers; i++ {
-        go func(startNonce uint64) {
-            localBlock := block
-            for nonce := startNonce; nonce < startNonce+attemptsPerWorker; nonce++ {
-                localBlock.Nonce = nonce
-                localBlock.Hash = CalculateHash(localBlock)
-                
-                if IsValidProof(localBlock.Hash, localBlock.Difficulty) {
-                    results <- result{block: localBlock}
-                    return
-                }
-            }
-            results <- result{err: errors.New("not found")}
-        }(i * attemptsPerWorker)
-    }
-    
-    // 最初の成功を待つ
-    for i := uint64(0); i < workers; i++ {
-        res := <-results
-        if res.err == nil {
-            return res.block, nil
-        }
-    }
-    
-    return Block{}, errors.New("failed to find valid proof")
-}
-```
-
 ### 3. Chainへの統合
 ```go
 func (c *Chain) mineBlockWithDifficulty(difficulty uint64) (*Block, error) {

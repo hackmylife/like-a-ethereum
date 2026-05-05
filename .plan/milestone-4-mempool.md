@@ -216,6 +216,21 @@ case "sendTransaction":
 }
 ```
 
+**main.go に追加するdispatchケース:**
+```go
+case "mineBlock":
+    block, err := c.mineBlock()
+    if err != nil {
+        return nil, rpcInvalidParams(err)
+    }
+
+    return map[string]any{
+        "blockNumber": toHex(block.Number),
+        "blockHash":   block.Hash,
+        "txCount":     toHex(uint64(len(block.Transactions))),
+    }, nil
+```
+
 ##### txpool_content
 ```json
 {
@@ -224,6 +239,17 @@ case "sendTransaction":
   "params": [],
   "id": 1
 }
+```
+
+**main.go に追加するdispatchケース:**
+```go
+case "txpool_content":
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    return map[string]any{
+        "pending": c.Mempool.GetAll(),
+    }, nil
 ```
 
 ### 5. ブロック生成ロジックの変更

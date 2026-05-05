@@ -130,7 +130,69 @@ func (p *JSONPersistence) LoadState() (map[string]Account, error) {
     return state, nil
 }
 
-// TxIndexとBlockIndexも同様に実装...
+func (p *JSONPersistence) SaveTxIndex(index map[string]TxLocation) error {
+    if err := p.ensureDir(); err != nil {
+        return err
+    }
+    
+    data, err := json.MarshalIndent(index, "", "  ")
+    if err != nil {
+        return err
+    }
+    
+    return os.WriteFile(filepath.Join(p.dataDir, "tx_index.json"), data, 0644)
+}
+
+func (p *JSONPersistence) LoadTxIndex() (map[string]TxLocation, error) {
+    path := filepath.Join(p.dataDir, "tx_index.json")
+    
+    data, err := os.ReadFile(path)
+    if os.IsNotExist(err) {
+        return make(map[string]TxLocation), nil
+    }
+    if err != nil {
+        return nil, err
+    }
+    
+    var index map[string]TxLocation
+    if err := json.Unmarshal(data, &index); err != nil {
+        return nil, err
+    }
+    
+    return index, nil
+}
+
+func (p *JSONPersistence) SaveBlockIndex(index map[string]uint64) error {
+    if err := p.ensureDir(); err != nil {
+        return err
+    }
+    
+    data, err := json.MarshalIndent(index, "", "  ")
+    if err != nil {
+        return err
+    }
+    
+    return os.WriteFile(filepath.Join(p.dataDir, "block_index.json"), data, 0644)
+}
+
+func (p *JSONPersistence) LoadBlockIndex() (map[string]uint64, error) {
+    path := filepath.Join(p.dataDir, "block_index.json")
+    
+    data, err := os.ReadFile(path)
+    if os.IsNotExist(err) {
+        return make(map[string]uint64), nil
+    }
+    if err != nil {
+        return nil, err
+    }
+    
+    var index map[string]uint64
+    if err := json.Unmarshal(data, &index); err != nil {
+        return nil, err
+    }
+    
+    return index, nil
+}
 ```
 
 ### 4. Chain構造体の変更

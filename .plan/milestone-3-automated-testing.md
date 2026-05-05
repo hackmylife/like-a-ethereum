@@ -200,29 +200,110 @@ func TestEthGetBalance(t *testing.T) {
 package testutil
 
 import (
+    "bytes"
     "crypto/ed25519"
     "crypto/rand"
+    "encoding/hex"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "net/http/httptest"
     "testing"
-    
+    "time"
+
     "github.com/stretchr/testify/require"
 )
 
 func GenerateKeyPair(t *testing.T) (ed25519.PrivateKey, ed25519.PublicKey) {
+    t.Helper()
     pub, priv, err := ed25519.GenerateKey(rand.Reader)
     require.NoError(t, err)
     return priv, pub
 }
 
+// SetupTestChain はgenesisファイルを使わず直接Chainを構築する
 func SetupTestChain(t *testing.T, balances map[string]uint64) *chain.Chain {
-    // テスト用のチェーンをセットアップ
+    t.Helper()
+
+    state := make(map[string]Account)
+    for addr, bal := range balances {
+        n, err := normalizeAddress(addr)
+        require.NoError(t, err)
+        state[n] = Account{Address: n, Balance: bal, Nonce: 0}
+    }
+
+    c := &chain.Chain{
+        State:      state,
+        TxIndex:    make(map[string]TxLocation),
+        BlockIndex: make(map[string]uint64),
+    }
+
+    genesis := Block{
+        Number:       0,
+        ParentHash:   "0x0000000000000000000000000000000000000000000000000000000000000000",
+        Timestamp:    time.Now().Unix(),
+        Transactions: []Transaction{},
+        StateRoot:    c.ComputeStateRoot(),
+    }
+    genesis.Hash = blockHash(genesis)
+    c.Blocks = []Block{genesis}
+    c.BlockIndex[genesis.Hash] = genesis.Number
+
+    return c
 }
 
-func CreateAndSignTransaction(t *testing.T, priv ed25519.PrivateKey, to string, value, nonce uint64) tx.Transaction {
-    // テスト用のトランザクションを作成・署名
+// CreateAndSignTransaction はテスト用のトランザクションを作成・署名して返す
+func CreateAndSignTransaction(t *testing.T, priv ed25519.PrivateKey, to string, value, nonce uint64) Transaction {
+    t.Helper()
+
+    pub := priv.Public().(ed25519.PublicKey)
+    from := addressFromPubkey(pub)
+
+    toAddr, err := normalizeAddress(to)
+    require.NoError(t, err)
+
+    tx := Transaction{
+        From:   from,
+        To:     toAddr,
+        Value:  value,
+        Nonce:  nonce,
+        PubKey: "0x" + hex.EncodeToString(pub),
+    }
+
+    sig := ed25519.Sign(priv, txSignBytes(tx))
+    tx.Signature = "0x" + hex.EncodeToString(sig)
+    tx.Hash = txHash(tx)
+
+    return tx
 }
 
-func CallRPC(t *testing.T, server *http.Server, method string, params []any) map[string]any {
-    // RPC呼び出しのヘルパー
+// CallRPC はhttptestサーバー経由でRPCメソッドを呼び出し、レスポンスをmap[string]anyで返す
+func CallRPC(t *testing.T, server *httptest.Server, method string, params []any) map[string]any {
+    t.Helper()
+
+    body, err := json.Marshal(map[string]any{
+        "jsonrpc": "2.0",
+        "method":  method,
+        "params":  params,
+        "id":      1,
+    })
+    require.NoError(t, err)
+
+    resp, err := http.Post(server.URL, "application/json", bytes.NewReader(body))
+    require.NoError(t, err)
+    defer resp.Body.Close()
+
+    var result map[string]any
+    require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+    return result
+}
+
+// SetupTestServer はChainからhttptestサーバーを起動して返す
+func SetupTestServer(t *testing.T, c *chain.Chain) *httptest.Server {
+    t.Helper()
+    server := httptest.NewServer(http.HandlerFunc(c.HandleRPC))
+    t.Cleanup(server.Close)
+    return server
 }
 ```
 
