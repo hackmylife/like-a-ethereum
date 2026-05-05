@@ -59,6 +59,12 @@ func (c *Chain) addTransaction(tx Transaction) (map[string]any, error) {
 
 	block.Hash = blockHash(block)
 	c.Blocks = append(c.Blocks, block)
+	c.BlockIndex[block.Hash] = block.Number
+
+	c.TxIndex[verified.Hash] = TxLocation{
+		BlockNumber: block.Number,
+		TxIndex:     0,
+	}
 
 	return map[string]any{
 		"transactionHash": verified.Hash,

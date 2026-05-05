@@ -110,7 +110,9 @@ func NewChainFromGenesis(path string) (*Chain, error) {
 	}
 
 	c := &Chain{
-		State: state,
+		State:      state,
+		TxIndex:    make(map[string]TxLocation),
+		BlockIndex: make(map[string]uint64),
 	}
 
 	genesis := Block{
@@ -123,6 +125,7 @@ func NewChainFromGenesis(path string) (*Chain, error) {
 
 	genesis.Hash = blockHash(genesis)
 	c.Blocks = []Block{genesis}
+	c.BlockIndex[genesis.Hash] = genesis.Number
 
 	return c, nil
 }

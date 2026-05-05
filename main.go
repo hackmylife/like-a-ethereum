@@ -89,6 +89,65 @@ func (c *Chain) dispatch(method string, params json.RawMessage) (any, *rpcError)
 
 		return receipt, nil
 
+	case "eth_getTransactionCount":
+		addr, err := parseGetTransactionCountParams(params)
+		if err != nil {
+			return nil, rpcInvalidParams(err)
+		}
+
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		acct := c.State[addr]
+		if acct.Address == "" {
+			return toHex(uint64(0)), nil
+		}
+		return toHex(acct.Nonce), nil
+
+	case "eth_getTransactionByHash":
+		hash, err := paraseGetTransactionByHashParams(params)
+		if err != nil {
+			return nil, rpcInvalidParams(err)
+		}
+
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		loc, ok := c.TxIndex[hash]
+		if !ok {
+			return nil, nil
+		}
+
+		block := c.Blocks[loc.BlockNumber]
+		tx := block.Transactions[loc.TxIndex]
+
+		return map[string]any{
+			"hash":             tx.Hash,
+			"from":             tx.From,
+			"to":               tx.To,
+			"value":            toHex(tx.Value),
+			"nonce":            toHex(tx.Nonce),
+			"blockHash":        block.Hash,
+			"blockNumber":      block.Number,
+			"transactionIndex": toHex(uint64(loc.TxIndex)),
+		}, nil
+
+	case "eth_getBlockByHash":
+		hash, fullTx, err := parseGetBlockByHashParams(params)
+		if err != nil {
+			return nil, rpcInvalidParams(err)
+		}
+
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		idx, ok := c.BlockIndex[hash]
+		if !ok {
+			return nil, nil
+		}
+
+		return toRPCBlock(c.Blocks[idx], fullTx), nil
+
 	case "eth_getBlockByNumber":
 		number, fullTx, err := parseGetBlockParams(params)
 		if err != nil {

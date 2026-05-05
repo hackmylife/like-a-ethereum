@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 )
 
 // rpc utils
@@ -48,6 +49,54 @@ func parseSingleObjectParam(params json.RawMessage, out any) error {
 	}
 
 	return json.Unmarshal(params, out)
+}
+
+func parseGetTransactionCountParams(params json.RawMessage) (string, error) {
+	var arr []json.RawMessage
+
+	if err := json.Unmarshal(params, &arr); err != nil || len(arr) < 1 {
+		return "", errors.New("eth_getTransactionCount expects [address, blockTag]")
+	}
+
+	var addr string
+	if err := json.Unmarshal(arr[0], &addr); err != nil || len(arr) < 1 {
+		return "", err
+	}
+
+	return normalizeAddress(addr)
+}
+
+func paraseGetTransactionByHashParams(params json.RawMessage) (hash string, err error) {
+	var arr []json.RawMessage
+
+	if err := json.Unmarshal(params, &arr); err != nil || len(arr) < 1 {
+		return "", errors.New("eth_getTransactionByHash expects [hash]")
+	}
+
+	if err := json.Unmarshal(arr[0], &hash); err != nil {
+		return "", err
+	}
+
+	return hash, nil
+}
+
+func parseGetBlockByHashParams(params json.RawMessage) (hash string, fullTx bool, err error) {
+	var arr []json.RawMessage
+
+	if err := json.Unmarshal(params, &arr); err != nil || len(arr) < 1 {
+		return "", false, errors.New("eth_getBlockByHash expects [hash, fullTx]" + strconv.Itoa(len(arr)))
+	}
+
+	if err := json.Unmarshal(arr[0], &hash); err != nil {
+		return "", false, err
+	}
+
+	if len(arr) >= 2 {
+		_ = json.Unmarshal(arr[1], &fullTx)
+	}
+
+	return hash, fullTx, nil
+
 }
 
 func toRPCBlock(b Block, fullTx bool) map[string]any {

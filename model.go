@@ -31,9 +31,16 @@ type Block struct {
 }
 
 type Chain struct {
-	mu     sync.Mutex
-	State  map[string]Account
-	Blocks []Block
+	mu         sync.Mutex
+	State      map[string]Account
+	Blocks     []Block
+	TxIndex    map[string]TxLocation
+	BlockIndex map[string]uint64
+}
+
+type TxLocation struct {
+	BlockNumber uint64
+	TxIndex     int
 }
 
 type Genesis struct {
