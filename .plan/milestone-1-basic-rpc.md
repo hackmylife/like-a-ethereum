@@ -1,7 +1,18 @@
 # Milestone 1: 基本RPCの拡充（完了）
 
 ## 概要
-現在のJSON-RPC APIを拡張して、Ethereum互換の基本的なクエリ機能を追加します。
+Milestone 0のJSON-RPC API（4メソッド）を拡張して、Ethereum互換の基本的なクエリ機能を追加します。
+
+追加するのは3メソッドと、それを支える2つのインデックスです。
+
+| 追加RPC | 必要になる仕組み |
+|---|---|
+| `eth_getTransactionCount` | なし（Stateから引くだけ） |
+| `eth_getTransactionByHash` | `TxIndex`（txハッシュ → ブロック番号＋ブロック内位置） |
+| `eth_getBlockByHash` | `BlockIndex`（ブロックハッシュ → ブロック番号） |
+
+## 前提
+- Milestone 0が完了していること（パッケージ構成、RPC4メソッド）
 
 ## 1.1 eth_getTransactionCount
 
@@ -29,13 +40,11 @@
 ```
 
 ### 実装内容
-1. `dispatch` に `eth_getTransactionCount` を追加
+1. `internal/rpc/server.go` の `dispatch` に `eth_getTransactionCount` を追加
 2. `State[address].Nonce` をhex quantityで返す
 3. 存在しないアカウントは `0x0` を返す
 
-#### 具体的な実装コード
-
-**main.go に追加するdispatchケース:**
+**internal/rpc/server.go に追加するdispatchケース:**
 ```go
 case "eth_getTransactionCount":
     addr, err := parseGetTransactionCountParams(params)
@@ -43,17 +52,17 @@ case "eth_getTransactionCount":
         return nil, rpcInvalidParams(err)
     }
 
-    c.mu.Lock()
-    defer c.mu.Unlock()
+    c.Lock()
+    defer c.Unlock()
 
     acct := c.State[addr]
     if acct.Address == "" {
-        return toHex(uint64(0)), nil
+        return util.ToHex(uint64(0)), nil
     }
-    return toHex(acct.Nonce), nil
+    return util.ToHex(acct.Nonce), nil
 ```
 
-**rpc.go に追加するパラメータ解析関数:**
+**internal/rpc/server.go に追加するパラメータ解析関数:**
 ```go
 func parseGetTransactionCountParams(params json.RawMessage) (string, error) {
     var arr []json.RawMessage
@@ -63,53 +72,11 @@ func parseGetTransactionCountParams(params json.RawMessage) (string, error) {
     }
 
     var addr string
-    // err != nil だけで十分。この時点で len(arr) >= 1 は確認済みなので || len(arr) < 1 は不要
     if err := json.Unmarshal(arr[0], &addr); err != nil {
         return "", err
     }
 
-    return normalizeAddress(addr)
-}
-```
-
-**Chain構造体にTxIndexを追加:**
-```go
-type Chain struct {
-    mu         sync.Mutex
-    State      map[string]Account
-    Blocks     []Block
-    TxIndex    map[string]TxLocation  // 追加
-    BlockIndex map[string]uint64      // 追加
-}
-
-type TxLocation struct {
-    BlockNumber uint64
-    TxIndex     int
-}
-```
-
-**Chain初期化時に必ずmakeで初期化する（nilのままだとpanicになる）:**
-```go
-c := &Chain{
-    State:      state,
-    TxIndex:    make(map[string]TxLocation),
-    BlockIndex: make(map[string]uint64),
-}
-```
-
-**トランザクション追加時にインデックスを更新:**
-```go
-func (c *Chain) addTransaction(tx Transaction) (map[string]any, error) {
-    // ... 既存の検証と処理 ...
-    
-    // ブロック生成後にインデックスを更新
-    // キーはトランザクションハッシュ（verified.Hash）を使う。block.Hash ではない
-    c.TxIndex[verified.Hash] = TxLocation{
-        BlockNumber: block.Number,
-        TxIndex:     0, // 1トランザクションなので0
-    }
-    
-    return receipt, nil
+    return account.NormalizeAddress(addr)
 }
 ```
 
@@ -123,9 +90,9 @@ func (c *Chain) addTransaction(tx Transaction) (map[string]any, error) {
 ### 目的
 - トランザクションハッシュからトランザクションを検索できるようにする
 
-### 実装案
-1. `Chain` に `TxIndex map[string]TxLocation` を追加（1.1で実装済み）
-2. `TxLocation` 構造体を定義（1.1で実装済み）:
+### 実装内容
+
+**internal/tx/transaction.go に位置情報の型を追加:**
 ```go
 type TxLocation struct {
     BlockNumber uint64
@@ -133,9 +100,42 @@ type TxLocation struct {
 }
 ```
 
-### 具体的な実装コード
+**internal/chain/chain.go の Chain 構造体にインデックスを追加:**
+```go
+type Chain struct {
+    mu         sync.Mutex
+    State      map[string]account.Account
+    Blocks     []block.Block
+    TxIndex    map[string]tx.TxLocation // 追加: txハッシュ -> 位置
+    BlockIndex map[string]uint64        // 追加: ブロックハッシュ -> 番号（1.3で使用）
+}
+```
 
-**main.go に追加するdispatchケース:**
+**Chain初期化時に必ずmakeで初期化する（nilのままだとpanicになる）:**
+```go
+c := &Chain{
+    State:      state,
+    TxIndex:    make(map[string]tx.TxLocation),
+    BlockIndex: make(map[string]uint64),
+}
+```
+
+**AddTransaction のブロック生成後にインデックスを更新:**
+```go
+func (c *Chain) AddTransaction(t tx.Transaction) (map[string]any, error) {
+    // ... 既存の検証と状態遷移、ブロック生成 ...
+
+    // キーはトランザクションハッシュ（verified.Hash）を使う。blk.Hash ではない
+    c.TxIndex[verified.Hash] = tx.TxLocation{
+        BlockNumber: blk.Number,
+        TxIndex:     0, // 現時点は1ブロック1トランザクションなので常に0
+    }
+
+    return receipt, nil
+}
+```
+
+**internal/rpc/server.go に追加するdispatchケース:**
 ```go
 case "eth_getTransactionByHash":
     hash, err := parseGetTransactionByHashParams(params)
@@ -143,40 +143,41 @@ case "eth_getTransactionByHash":
         return nil, rpcInvalidParams(err)
     }
 
-    c.mu.Lock()
-    defer c.mu.Unlock()
+    c.Lock()
+    defer c.Unlock()
 
     loc, ok := c.TxIndex[hash]
     if !ok {
-        return nil, nil
+        return nil, nil // 未知のhashはnull
     }
 
-    block := c.Blocks[loc.BlockNumber]
-    tx := block.Transactions[loc.TxIndex]
+    b := c.Blocks[loc.BlockNumber]
+    t := b.Transactions[loc.TxIndex]
 
     return map[string]any{
-        "hash":        tx.Hash,
-        "from":        tx.From,
-        "to":          tx.To,
-        "value":       toHex(tx.Value),
-        "nonce":       toHex(tx.Nonce),
-        "blockHash":   block.Hash,
-        "blockNumber": toHex(block.Number),
-        "transactionIndex": toHex(uint64(loc.TxIndex)),
+        "hash":             t.Hash,
+        "from":             t.From,
+        "to":               t.To,
+        "value":            util.ToHex(t.Value),
+        "nonce":            util.ToHex(t.Nonce),
+        "blockHash":        b.Hash,
+        "blockNumber":      util.ToHex(b.Number),
+        "transactionIndex": util.ToHex(uint64(loc.TxIndex)),
     }, nil
 ```
 
-**rpc.go に追加するパラメータ解析関数:**
+注意: 現リポジトリの実装は `blockNumber` を `util.ToHex` に通し忘れて数値のまま返している
+（milestone-0の既知の問題3。Milestone 3で上のコードのとおりに修正する）。
+
+**internal/rpc/server.go に追加するパラメータ解析関数:**
 ```go
-func parseGetTransactionByHashParams(params json.RawMessage) (string, error) {
+func parseGetTransactionByHashParams(params json.RawMessage) (hash string, err error) {
     var arr []json.RawMessage
 
-    // &arr に Unmarshal すること
     if err := json.Unmarshal(params, &arr); err != nil || len(arr) < 1 {
         return "", errors.New("eth_getTransactionByHash expects [hash]")
     }
 
-    var hash string
     if err := json.Unmarshal(arr[0], &hash); err != nil {
         return "", err
     }
@@ -194,24 +195,21 @@ func parseGetTransactionByHashParams(params json.RawMessage) (string, error) {
 ### 目的
 - ブロックハッシュからブロックを取得できるようにする
 
-### 実装案
-1. `Chain` に `BlockIndex map[string]uint64` を追加
+### 実装内容
 
-### 具体的な実装コード
-
-**ブロック追加時にBlockIndexを更新（addTransaction内、およびGenesis生成後）:**
+**ブロック追加時にBlockIndexを更新（AddTransaction内）:**
 ```go
 // ブロックをBlocksに追加した直後に記録する
-c.BlockIndex[block.Hash] = block.Number
+c.BlockIndex[blk.Hash] = blk.Number
 ```
 
 **Genesis生成時にも忘れず追加（NewChainFromGenesis内）:**
 ```go
-c.Blocks = []Block{genesis}
+c.Blocks = []block.Block{genesis}
 c.BlockIndex[genesis.Hash] = genesis.Number
 ```
 
-**main.go に追加するdispatchケース:**
+**internal/rpc/server.go に追加するdispatchケース:**
 ```go
 case "eth_getBlockByHash":
     hash, fullTx, err := parseGetBlockByHashParams(params)
@@ -219,23 +217,22 @@ case "eth_getBlockByHash":
         return nil, rpcInvalidParams(err)
     }
 
-    c.mu.Lock()
-    defer c.mu.Unlock()
+    c.Lock()
+    defer c.Unlock()
 
     idx, ok := c.BlockIndex[hash]
     if !ok {
-        return nil, nil
+        return nil, nil // 未知のhashはnull
     }
 
-    return toRPCBlock(c.Blocks[idx], fullTx), nil
+    return block.ToRPCBlock(c.Blocks[idx], fullTx), nil
 ```
 
-**rpc.go に追加するパラメータ解析関数:**
+**internal/rpc/server.go に追加するパラメータ解析関数:**
 ```go
 func parseGetBlockByHashParams(params json.RawMessage) (hash string, fullTx bool, err error) {
     var arr []json.RawMessage
 
-    // &arr に Unmarshal すること。&err や &hash は誤り
     if err := json.Unmarshal(params, &arr); err != nil || len(arr) < 1 {
         return "", false, errors.New("eth_getBlockByHash expects [hash, fullTx]")
     }
@@ -252,6 +249,9 @@ func parseGetBlockByHashParams(params json.RawMessage) (hash string, fullTx bool
 }
 ```
 
+注意: 現リポジトリの実装はエラーメッセージ末尾にデバッグ用の `strconv.Itoa(len(arr))` が
+連結されたままになっている（milestone-0の既知の問題4。Milestone 3で除去する）。
+
 ### テストケース
 - Genesisブロックhashで取得できる
 - 最新ブロックhashで取得できる
@@ -259,19 +259,19 @@ func parseGetBlockByHashParams(params json.RawMessage) (hash string, fullTx bool
 
 ## 実装手順
 
-1. **eth_getTransactionCount**から実装
-   - `main.go` の `dispatch` にケースを追加
+1. **eth_getTransactionCount** から実装
+   - `internal/rpc/server.go` の `dispatch` にケースを追加
    - パラメータ解析関数を実装
-   - テスト用curlコマンドで動作確認
+   - curlで動作確認
 
-2. **eth_getTransactionByHash**を実装
-   - `model.go` に `TxLocation` を追加
-   - `Chain` 構造体に `TxIndex` を追加
-   - トランザクション追加時にインデックスを更新
+2. **eth_getTransactionByHash** を実装
+   - `internal/tx/transaction.go` に `TxLocation` を追加
+   - `internal/chain/chain.go` の `Chain` に `TxIndex` / `BlockIndex` を追加し、初期化とインデックス更新を入れる
+   - dispatchケースとパラメータ解析関数を追加
 
-3. **eth_getBlockByHash**を実装
-   - `Chain` 構造体に `BlockIndex` を追加
-   - ブロック追加時にインデックスを更新
+3. **eth_getBlockByHash** を実装
+   - Genesis生成時と `AddTransaction` 内で `BlockIndex` を更新
+   - dispatchケースとパラメータ解析関数を追加
 
 ## 検証方法
 各APIを実装後、READMEのテスト手順に加えて以下のcurlコマンドで確認：
@@ -311,6 +311,7 @@ curl -s -X POST localhost:8545 \
   -d '{"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":["0x0000000000000000000000000000000000000000000000000000000000000000"],"id":5}'
 # 期待出力:
 # {"jsonrpc":"2.0","id":5}
+#（本来は "result":null を含むべき。milestone-0の既知の問題5）
 
 # eth_getBlockByHash（Genesisブロックhashで取得）
 curl -s -X POST localhost:8545 \
@@ -331,3 +332,6 @@ curl -s -X POST localhost:8545 \
 - すべてのAPIが期待通りに応答する
 - 既存のREADME手順が変わらず動作する
 - エラーケース（存在しないhash/address）で適切に `null` を返す
+
+## 次のステップ
+Milestone 2はフラット構成からパッケージ構成へのリファクタリングの記録です。Milestone 0の手順書どおりに最初からパッケージ構成で実装している場合は読み物としてスキップし、Milestone 3（自動テスト）に進んでください。
