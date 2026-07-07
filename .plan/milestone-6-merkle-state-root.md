@@ -199,6 +199,9 @@ func (t *MerkleTree) GenerateProof(targetHash string) (*MerkleProof, error) {
 }
 
 // findPath は再帰的にリーフを探索し、(リーフインデックス, siblingハッシュ列) を返す。
+// 注意: path はroot側→リーフ側の順に並ぶ（VerifyProofは逆順に適用する）。
+// また append はスライスの底層配列を共有しうるため、実装時は path をコピーしてから
+// 追加するのが安全。
 // leafIndex はビットマスクとして VerifyProof に渡される（i ビット目が 0 なら左、1 なら右）。
 // depth は現在の深さ、bitPos はそのレベルでの右ビットの重み。
 func (t *MerkleTree) findPath(node *MerkleNode, target string, path []string, leafIndex int, bitPos int) (int, []string) {
@@ -223,15 +226,20 @@ func (t *MerkleTree) findPath(node *MerkleNode, target string, path []string, le
     return rightIndex, rightResult
 }
 
+// VerifyProof はリーフから上に向かってrootを再計算する。
+// findPath の path はroot側→リーフ側の順に並ぶため、逆順（リーフ側の兄弟から）に
+// 適用する必要がある。先頭から適用するとリーフとroot直下の兄弟を最初に結合して
+// しまい、深さ2以上のツリーで必ず検証に失敗する。
 func VerifyProof(rootHash, targetHash string, proof *MerkleProof) bool {
     current := targetHash
     
-    for i, hash := range proof.Hashes {
+    for i := len(proof.Hashes) - 1; i >= 0; i-- {
+        hash := proof.Hashes[i]
         if proof.Index&(1<<i) == 0 {
-            // 左側
+            // 自分が左側
             current = hashParent(current, hash)
         } else {
-            // 右側
+            // 自分が右側
             current = hashParent(hash, current)
         }
     }

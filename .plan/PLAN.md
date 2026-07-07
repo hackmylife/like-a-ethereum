@@ -6,6 +6,8 @@
 
 ## 現在の到達点
 
+実装済みの全体像（データ構造・RPC仕様・既知の問題を含む）は `milestone-0-base-node.md` にまとめてある。
+
 実装済み:
 
 - アカウント
@@ -41,6 +43,12 @@
   - `eth_getBalance`
   - `sendTransaction`
   - `eth_getBlockByNumber`
+  - `eth_getTransactionCount`
+  - `eth_getTransactionByHash`
+  - `eth_getBlockByHash`
+
+- パッケージ構成
+  - `cmd/minieth` と `internal/`（account / block / chain / crypto / rpc / state / tx / util）に分割済み
 
 - 簡易チェーン
   - Genesisブロック生成
@@ -67,7 +75,7 @@
 - PoS
 - Gas完全再現
 
-## Milestone 1: 基本RPCの拡充
+## Milestone 1: 基本RPCの拡充（完了）
 
 ### 1.1 eth_getTransactionCount
 
@@ -148,7 +156,7 @@ type TxLocation struct {
 - 最新ブロックhashで取得できる
 - 未知のhashでは `null`
 
-## Milestone 2: コード分割
+## Milestone 2: コード分割（完了）
 
 目的:
 
@@ -389,7 +397,7 @@ type StateLeaf struct {
 CLI案:
 
 ```bash
-go run . node --genesis genesis.json --datadir ./data --addr :8545
+go run ./cmd/minieth node --genesis genesis.json --datadir ./data --addr :8545
 ```
 
 テスト:
@@ -507,7 +515,43 @@ total difficultyが最大のチェーンを採用する
 - 長い方がheadになる
 - head切り替え時にstateも切り替わる
 
-## Milestone 11: Gas風の仕組み
+## Milestone 11: QBFTコンセンサス
+
+目的:
+
+- BFT合意の基本（PRE-PREPARE / PREPARE / COMMIT、quorum = 2f+1）を学ぶ
+- 即時ファイナリティを体験し、PoW＋Fork Choice（確率的ファイナリティ）と対比する
+
+前提:
+
+- Milestone 9のP2Pが必須（validator間のメッセージ交換で合意するため、最低4ノード必要）
+- Milestone 10まで終えてから入ると「QBFTではなぜフォークもリオーグも起きないか」が対比で分かる
+
+追加要素:
+
+- genesisへのvalidator set定義
+- Block: `Round` / `Proposer` / `CommitSeals`（CommitSealsはハッシュ計算から除外する）
+- proposer選出: `(sequence + round) % len(validators)`
+- 3フェーズ合意の状態機械、round change（タイムアウトで次proposerへ）
+- ブロック検証をPoWチェックから「2f+1のcommit seal検証」へ差し替え（`--consensus pow|qbft` で切り替え）
+
+追加RPC:
+
+- `qbft_propose`
+- `qbft_message`（P2P用）
+- `qbft_getValidators`
+- `qbft_getState`
+
+テスト:
+
+- 4ノードでブロックが確定し、全ノードのチェーンが一致する
+- 1台停止では合意が進み、2台停止では止まる（f=1の体感）
+- 不正なproposerの提案・commit seal不足のブロックが拒否される
+- proposer停止時にround changeで復帰する
+
+詳細は `milestone-11-qbft.md` を参照。
+
+## Milestone 12: Gas風の仕組み
 
 目的:
 
@@ -547,7 +591,7 @@ miner.balance += fee
 - minerにfeeが入る
 - 残高不足なら失敗する
 
-## Milestone 12: Contract風機能
+## Milestone 13: Contract風機能
 
 EVMをいきなり作らず、まずは簡易コントラクトを実装します。
 
@@ -577,7 +621,7 @@ type Contract interface {
 - callとtransactionの違い
 - state changing call
 
-## Milestone 13: Ethereum形式への接近
+## Milestone 14: Ethereum形式への接近
 
 目的:
 
@@ -599,36 +643,29 @@ type Contract interface {
 
 ## 優先順位
 
-推奨順:
+推奨順（milestoneファイルの番号に対応）:
 
-1. `eth_getTransactionCount`
-2. `eth_getTransactionByHash`
-3. 自動テスト
-4. コード分割
-5. mempool
-6. 複数tx入りブロック
-7. Merkle Tree stateRoot
-8. 永続化
-9. PoW
-10. P2P
-11. Fork Choice
+0. 基礎実装（完了・`milestone-0-base-node.md` に記録）
+1. 基本RPCの拡充（完了）
+2. コード分割（完了）
+3. 自動テスト（次はここ）
+4. mempool
+5. 複数tx入りブロック
+6. Merkle Tree stateRoot
+7. 永続化
+8. PoW
+9. P2P
+10. Fork Choice
+11. QBFTコンセンサス
 12. Gas
 13. Contract風機能
 14. Ethereum形式への接近
 
 ## 次に着手するIssue候補
 
-### Issue 1: eth_getTransactionCountを追加する
+### Issue 1: eth_getTransactionCountを追加する（完了）
 
-概要:
-
-- 指定アドレスのnonceを返すRPCを追加する
-
-受け入れ条件:
-
-- Genesis直後のnonceが `0x0`
-- 送金後の送信者nonceが `0x1`
-- 存在しないアドレスは `0x0`
+Milestone 1で実装済み。
 
 ### Issue 2: Go testを追加する
 

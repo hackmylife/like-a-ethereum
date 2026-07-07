@@ -1,4 +1,4 @@
-# Milestone 11: Gas風の仕組み
+# Milestone 12: Gas風の仕組み
 
 ## 概要
 現在の実装ではトランザクションは無料で処理されていますが、実際のEthereumではGasという手数料機構があります。このマイルストーンでは、簡易的なGas仕組みを実装して、トランザクション手数料の基本を学びます。
@@ -123,32 +123,38 @@ type MinerReward struct {
 }
 
 func CalculateBlockReward(blockNumber uint64) uint64 {
-    // 簡易的なブロック報酬：最初は5 ETH、徐々に減少
+    // 簡易的なブロック報酬：徐々に減少
+    // 注意: 本物のEthereumはWei単位（5 ETH = 5e18）だが、この実装のgenesis残高は
+    // 1000程度の小さな整数なので、単位系を合わせて小さな値にしておく。
+    // Wei単位を導入する場合はgenesis.jsonの残高も一緒に桁を上げること。
     if blockNumber < 100 {
-        return 5 * 1e18 // 5 ETH（Wei単位）
+        return 50
     } else if blockNumber < 200 {
-        return 3 * 1e18 // 3 ETH
+        return 30
     } else {
-        return 2 * 1e18 // 2 ETH
+        return 20
     }
 }
 
-func (c *Chain) distributeRewards(block *Block, totalGasFees uint64) error {
-    blockReward := CalculateBlockReward(block.Number)
+// distributeRewardsToState はブロック生成中の一時stateに対して報酬を分配する。
+// 重要: StateRoot計算前（マイニング前）に呼ぶこと。マイニング後に c.State へ直接
+// 反映すると、ブロックのStateRootにマイナー報酬が含まれず、検証で不一致になる。
+func distributeRewardsToState(state map[string]Account, coinbase string, blockNumber uint64, totalGasFees uint64) error {
+    blockReward := CalculateBlockReward(blockNumber)
     
     // マイナーに報酬を分配
-    miner := c.State[block.Coinbase]
+    miner := state[coinbase]
     if miner.Address == "" {
         // マイナーアカウントがなければ作成
         miner = Account{
-            Address: block.Coinbase,
+            Address: coinbase,
             Balance: 0,
             Nonce:   0,
         }
     }
     
     miner.Balance += blockReward + totalGasFees
-    c.State[block.Coinbase] = miner
+    state[coinbase] = miner
     
     return nil
 }
@@ -157,14 +163,28 @@ func (c *Chain) distributeRewards(block *Block, totalGasFees uint64) error {
 ### 3. ヘルパー型・関数
 
 ```go
-// TransactionSorter は GasPrice の高い順にトランザクションをソートする
+// TransactionSorter は Milestone 5 と同じ (From, Nonce) 順を維持する。
+//
+// 注意: 単純に「GasPriceの高い順」でソートすると、同一送信元の nonce=1 が
+// nonce=0 より先に並んで適用に失敗する。かといって「同一送信元はnonce順、
+// それ以外はgasPrice順」という比較関数は推移律を満たさず sort が壊れる。
+// gasPrice優先を本格的にやる場合は、本物のEthereumと同様に
+// 「送信元ごとにnonce順のキューを作り、各キューの先頭をgasPriceで選ぶ」
+// 方式にする。このマイルストーンではソート順は変えず、gasPriceは手数料の
+// 計算にのみ使う。
 type TransactionSorter []Transaction
 
-func (s TransactionSorter) Len() int           { return len(s) }
-func (s TransactionSorter) Less(i, j int) bool { return s[i].GasPrice > s[j].GasPrice }
-func (s TransactionSorter) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s TransactionSorter) Len() int { return len(s) }
+func (s TransactionSorter) Less(i, j int) bool {
+    if s[i].From != s[j].From {
+        return s[i].From < s[j].From
+    }
+    return s[i].Nonce < s[j].Nonce
+}
+func (s TransactionSorter) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
-// copyState は現在の c.State のシャローコピーを返す。
+// copyState / applyTransactionToState は Milestone 5 で実装済み（ここは再掲）。
+// Gas込みの検証・適用は下の applyTransactionToStateWithGas を使う。
 func (c *Chain) copyState() map[string]Account {
     copied := make(map[string]Account, len(c.State))
     for k, v := range c.State {
@@ -335,37 +355,42 @@ func (c *Chain) mineBlockWithGas(difficulty uint64, coinbase string) (*Block, er
         return nil, errors.New("no valid transactions")
     }
     
-    // 状態をマージ
-    c.State = tempState
+    // 報酬分配もtempStateに対して行う（StateRootに報酬を反映させるため、
+    // StateRoot計算・マイニングより前に行う必要がある）
+    newBlockNumber := c.Blocks[len(c.Blocks)-1].Number + 1
+    if err := distributeRewardsToState(tempState, coinbase, newBlockNumber, totalGasFees); err != nil {
+        return nil, err
+    }
     
-    // ブロック生成
+    // ブロック生成（StateRootは報酬分配まで反映したtempStateから計算。
+    // computeStateRootOf はMilestone 8で導入済み）
     block := Block{
-        Number:       c.Blocks[len(c.Blocks)-1].Number + 1,
+        Number:       newBlockNumber,
         ParentHash:   c.Blocks[len(c.Blocks)-1].Hash,
         Timestamp:    time.Now().Unix(),
         Nonce:        0,
         Difficulty:   difficulty,
         Coinbase:     coinbase,
         Transactions: appliedTxs,
-        StateRoot:    c.computeStateRootLocked(),
+        StateRoot:    computeStateRootOf(tempState),
     }
     
-    // マイニング実行
+    // マイニング実行（失敗したらtempStateを破棄するだけで済む）
     minedBlock, err := pow.MineBlock(block, 1000000)
     if err != nil {
         return nil, err
     }
     
-    // 報酬分配
-    if err := c.distributeRewards(&minedBlock, totalGasFees); err != nil {
-        return nil, err
-    }
+    // マイニング成功後に状態をマージ
+    c.State = tempState
     
     // ブロックを追加
     c.Blocks = append(c.Blocks, minedBlock)
     
-    // mempoolをクリア
-    c.Mempool.Clear()
+    // 成功したtxだけをmempoolから削除（失敗txは残す。Clear()で全消ししない）
+    for _, tx := range appliedTxs {
+        c.Mempool.Remove(tx.Hash)
+    }
     
     return &minedBlock, nil
 }
@@ -381,6 +406,8 @@ case "sendTransaction":
     }
     
     // デフォルト値を設定
+    // 注意: GasLimit/GasPriceを署名対象に含める設計にする場合、サーバ側での補完は
+    // 署名を壊すため、ここで補完せず未設定txを拒否する（文末の注意点を参照）
     if tx.GasLimit == 0 {
         gasCalc := gas.NewGasCalculator()
         estimated, _ := gasCalc.EstimateGas(tx)
@@ -388,10 +415,12 @@ case "sendTransaction":
     }
     
     if tx.GasPrice == 0 {
-        tx.GasPrice = 1e9 // 1 Gwei（デフォルト）
+        // 本物は1 Gwei = 1e9 Wei程度だが、この実装の残高スケールでは
+        // 手数料（21000 × gasPrice）が払えなくなるため、デフォルトは1にする
+        tx.GasPrice = 1
     }
     
-    // 署名・ハッシュを検証（既存の validateTransaction を使用）
+    // 署名・ハッシュを検証（validateTransaction は tx.VerifyAndNormalizeTx を呼ぶ薄いラッパー）
     if err := validateTransaction(tx); err != nil {
         return nil, rpcInvalidParams(err)
     }
@@ -477,19 +506,21 @@ func cmdSign(args []string) {
 ### 1. 基本的なGas手数料
 ```go
 func TestBasicGasFee(t *testing.T) {
+    // gasUsed=21000のため、手数料(21000×gasPrice)を払える残高が必要
     chain := setupTestChain(t, map[string]uint64{
-        aliceAddr:   1000,
+        aliceAddr:   1_000_000,
         minerAddr:   0,
     })
     
     tx := createAndSignTransactionWithGas(t, alicePriv, bobAddr, 100, 0, 21000, 10)
+    chain.Mempool.Add(tx)
     
     block, err := chain.mineBlockWithGas(1, minerAddr)
     require.NoError(t, err)
     
-    // Aliceの残高：1000 - 100 - (21000 * 10) = 790
+    // Aliceの残高：1,000,000 - 100 - (21000 * 10) = 789,900
     alice := chain.State[aliceAddr]
-    assert.Equal(t, uint64(790), alice.Balance)
+    assert.Equal(t, uint64(789_900), alice.Balance)
     
     // Bobの残高：100
     bob := chain.State[bobAddr]
@@ -538,7 +569,7 @@ func TestInsufficientBalanceWithGas(t *testing.T) {
 ```go
 func TestGasPriceImpact(t *testing.T) {
     chain := setupTestChain(t, map[string]uint64{
-        aliceAddr: 1000,
+        aliceAddr: 1_000_000,
         minerAddr: 0,
     })
     
@@ -591,7 +622,7 @@ func TestGasPriceImpact(t *testing.T) {
 ### 手動テスト
 ```bash
 # Gas付きでトランザクション署名
-go run . sign --priv 0x... --to 0x... --value 100 --nonce 0 --gaslimit 21000 --gasprice 1000000000
+go run ./cmd/minieth sign --priv 0x... --to 0x... --value 100 --nonce 0 --gaslimit 21000 --gasprice 1000000000
 
 # マイナー指定でブロック採掘
 curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"mineBlock","params":[{"difficulty":1,"coinbase":"0xminer"}],"id":1}'
@@ -600,7 +631,9 @@ curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"mineBlock","params
 curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"eth_getBalance","params":["0xminer","latest"],"id":2}'
 
 # Gas見積もり
-curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"eth_estimateGas","params":[{"from":"0x...","to":"0x...","value":"0x64"}],"id":3}'
+curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"eth_estimateGas","params":[{"from":"0x...","to":"0x...","value":100}],"id":3}'
+# 注意: Transaction.Value はuint64なので、この実装ではJSON数値で渡す
+#（本物のeth_estimateGasは "0x64" のようなhex quantity文字列を受ける）
 ```
 
 ## 完了条件
@@ -611,7 +644,7 @@ curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"eth_estimateGas","
 - 既存の機能がすべて動作する
 
 ## 次のステップ
-Gas仕組みが実装できたら、Milestone 12でContract風機能を実装します。これにより、スマートコントラクトの基本概念を学べます。
+Gas仕組みが実装できたら、Milestone 13でContract風機能を実装します。これにより、スマートコントラクトの基本概念を学べます。
 
 ## 注意点
 この実装は本物のEthereum Gas機構とは異なります：
@@ -622,3 +655,22 @@ Gas仕組みが実装できたら、Milestone 12でContract風機能を実装し
 - この実装：単純な手数料計算
 
 あくまでGasの基本概念を学ぶための簡易実装です。
+
+### 署名対象にGasフィールドを含めること
+
+GasLimit / GasPrice を署名対象（txSignBytes）に含めないと、第三者が手数料部分を
+改ざんできてしまいます。一方で署名対象に含めるなら、サーバ側でデフォルト値を
+補完する設計（上のsendTransaction例）とは両立しません（補完した時点で署名不一致になる）。
+実装時はクライアント（signコマンド）側で必ず値を決めてから署名する方式に統一してください。
+
+### 単位系について
+
+本物のEthereumはWei（1 ETH = 1e18 Wei）単位ですが、この実装のgenesis残高は1000程度の
+小さな整数です。gasUsed=21000を採用する場合、手数料（21000 × gasPrice）を払える残高が
+必要になるため、genesis.jsonの初期残高を十分大きく（例: 1,000,000以上）してください。
+
+### コンセンサスモードとの関係
+
+この章のコード例はPoWモード（mineBlock）前提です。QBFTモード（Milestone 11）には
+mineBlockが無いため、proposerのブロック構築処理（BuildBlockProposal）に同じ
+Gas検証・報酬分配ロジックを組み込み、報酬の受け取り先は `block.Proposer` にします。

@@ -281,30 +281,22 @@ func (c *Chain) saveToDisk() error {
 }
 ```
 
-### 5. トランザクションとブロック追加時の永続化
-```go
-func (c *Chain) addTransaction(tx Transaction) (map[string]any, error) {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    
-    // 既存の処理...
-    
-    // ブロック追加後に永続化
-    if err := c.saveToDisk(); err != nil {
-        // 永続化失敗時の処理
-        log.Printf("Failed to save to disk: %v", err)
-    }
-    
-    return receipt, nil
-}
+### 5. ブロック確定時の永続化
 
+Milestone 4以降、状態（State / Blocks / 各インデックス）が変わるのはブロック確定時
+（mineBlock）だけなので、永続化のフックはmineBlockに入れる。
+sendTransactionはmempoolに積むだけなので保存不要（mempool自体を保存するかは任意で、
+再起動時にクリアされる仕様でも学習用には十分）。
+
+```go
 func (c *Chain) mineBlock() (*Block, error) {
     c.mu.Lock()
     defer c.mu.Unlock()
     
     // 既存の処理...
     
-    // ブロック追加後に永続化
+    // ブロック追加後に永続化。失敗したらブロック追加自体をエラーにする
+    //（メモリ上だけ進んでディスクと食い違う状態を作らない）
     if err := c.saveToDisk(); err != nil {
         return nil, fmt.Errorf("failed to save block: %w", err)
     }
@@ -327,7 +319,7 @@ func cmdNode(args []string) {
     chain, err := NewChainWithPersistence(*genesisPath, *dataDir)
     must(err)
     
-    http.HandleFunc("/", chain.handleRPC)
+    http.HandleFunc("/", rpc.HandleRPC(chain))
     
     log.Printf("mini ethereum-like node listening on %s", *listenAddr)
     log.Printf("data directory: %s", *dataDir)
@@ -343,31 +335,28 @@ func cmdNode(args []string) {
 ```go
 func TestBasicPersistence(t *testing.T) {
     tempDir := t.TempDir()
+    // writeTestGenesis は一時ファイルにgenesis JSONを書いてパスを返すヘルパー
+    //（Milestone 3のtestutil.SetupTestChainと同じ手法。testutilに切り出す）
+    genesisPath := writeTestGenesis(t, map[string]uint64{aliceAddr: 1000})
     
-    // 1. チェーンを作成してトランザクション処理
-    chain, err := NewChainWithPersistence("", tempDir)
+    // 1. チェーンを作成してブロックを1つ採掘
+    c, err := NewChainWithPersistence(genesisPath, tempDir)
     require.NoError(t, err)
     
-    // Genesisブロックを設定
-    chain.State = map[string]Account{
-        aliceAddr: {Address: aliceAddr, Balance: 1000, Nonce: 0},
-    }
-    chain.Blocks = []Block{createGenesisBlock(chain.State)}
-    
-    // トランザクション処理
-    tx := createAndSignTransaction(t, alicePriv, bobAddr, 100, 0)
-    _, err = chain.AddTransaction(tx)
+    txn := createAndSignTransaction(t, alicePriv, bobAddr, 100, 0)
+    require.NoError(t, c.Mempool.Add(txn))
+    _, err = c.MineBlock()
     require.NoError(t, err)
     
-    // 2. 新しいチェーンインスタンスを作成（データ読み込み）
-    chain2, err := NewChainWithPersistence("", tempDir)
+    // 2. 同じdatadirで新しいチェーンインスタンスを作成（データ読み込み）
+    c2, err := NewChainWithPersistence(genesisPath, tempDir)
     require.NoError(t, err)
     
     // 3. 状態が復元されていることを確認
-    assert.Equal(t, len(chain.Blocks), len(chain2.Blocks))
-    assert.Equal(t, chain.Blocks[len(chain.Blocks)-1].Hash, chain2.Blocks[len(chain2.Blocks)-1].Hash)
+    assert.Equal(t, len(c.Blocks), len(c2.Blocks))
+    assert.Equal(t, c.Blocks[len(c.Blocks)-1].Hash, c2.Blocks[len(c2.Blocks)-1].Hash)
     
-    alice := chain2.State[aliceAddr]
+    alice := c2.State[aliceAddr]
     assert.Equal(t, uint64(900), alice.Balance)
     assert.Equal(t, uint64(1), alice.Nonce)
 }
@@ -377,13 +366,16 @@ func TestBasicPersistence(t *testing.T) {
 ```go
 func TestEmptyDataDirectory(t *testing.T) {
     tempDir := t.TempDir()
+    genesisPath := writeTestGenesis(t, map[string]uint64{aliceAddr: 1000})
     
-    chain, err := NewChainWithPersistence("", tempDir)
+    c, err := NewChainWithPersistence(genesisPath, tempDir)
     require.NoError(t, err)
     
-    // 空の状態で初期化される
-    assert.Empty(t, chain.Blocks)
-    assert.Empty(t, chain.State)
+    // 保存データがなければGenesisから初期化される
+    //（Blocksが空になるのではなく、genesisブロック1つを持つ状態が正しい）
+    assert.Len(t, c.Blocks, 1)
+    assert.Equal(t, uint64(0), c.Blocks[0].Number)
+    assert.Equal(t, uint64(1000), c.State[aliceAddr].Balance)
 }
 ```
 
@@ -450,7 +442,7 @@ func TestPermissionError(t *testing.T) {
 ```bash
 # 1. データディレクトリを指定してノード起動
 mkdir -p ./test-data
-go run . node --genesis genesis.json --datadir ./test-data --addr :8545
+go run ./cmd/minieth node --genesis genesis.json --datadir ./test-data --addr :8545
 
 # 2. トランザクション処理
 curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"sendTransaction","params":[tx],"id":1}'
@@ -459,7 +451,7 @@ curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"mineBlock","params
 # 3. ノード停止（Ctrl+C）
 
 # 4. 同じデータディレクトリで再起動
-go run . node --genesis genesis.json --datadir ./test-data --addr :8545
+go run ./cmd/minieth node --genesis genesis.json --datadir ./test-data --addr :8545
 
 # 5. 状態が維持されていることを確認
 curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":3}'

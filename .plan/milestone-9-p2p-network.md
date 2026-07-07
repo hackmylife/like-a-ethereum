@@ -15,6 +15,13 @@
 node A -- HTTP -- node B -- HTTP -- node C
 ```
 
+### 前提: genesisブロックの一致
+
+チェーン同期・ブロック伝播は「全ノードが同一のgenesisブロック（同一hash）を持つこと」が前提になる。
+現在の実装はgenesisのTimestampに起動時刻（`time.Now()`）を使っているため、同じgenesis.jsonでも
+ノードごと・起動ごとにgenesis hashが変わってしまう。このマイルストーンに入る前に、
+genesisのtimestampを固定値にする修正が必要（`milestone-0-base-node.md` の既知の問題1を参照）。
+
 ## 新しい概念
 
 ### 1. Peer管理
@@ -143,8 +150,10 @@ func (p *P2PManager) GetPeers() []Peer {
 ```go
 // トランザクションのブロードキャスト
 func (p *P2PManager) BroadcastTransaction(tx Transaction) error {
-    p.mu.RLock()
-    defer p.mu.RUnlock()
+    // peer.Active / LastSeen を書き換えるため、RLockではなくLockを取る
+    //（RLock保持中の書き込みはデータ競合になる）
+    p.mu.Lock()
+    defer p.mu.Unlock()
     
     var errors []error
     
@@ -324,6 +333,9 @@ func (p *P2PManager) fetchChainFromPeer(address string, targetChain *Chain) erro
     }
     
     // チェーンを更新（簡易版：完全に置き換え）
+    // 注意: 本来は受信した全ブロックを検証（ハッシュ再計算・PoW・tx署名・
+    // state再計算とstateRootの一致確認）してから置き換えるべき。
+    // 無検証の置き換えは、悪意あるピアに任意の状態を注入されるのと同じ。
     targetChain.mu.Lock()
     defer targetChain.mu.Unlock()
     
@@ -348,10 +360,8 @@ type Chain struct {
 }
 
 func (c *Chain) addTransactionWithBroadcast(tx Transaction) (map[string]any, error) {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    
-    // 既存のトランザクション処理
+    // 注意: c.addTransaction が内部で c.mu を取得するため、ここでロックを取ってはいけない
+    //（取ると自己デッドロックする）
     receipt, err := c.addTransaction(tx)
     if err != nil {
         return nil, err
@@ -370,10 +380,7 @@ func (c *Chain) addTransactionWithBroadcast(tx Transaction) (map[string]any, err
 }
 
 func (c *Chain) mineBlockWithBroadcast(difficulty uint64) (*Block, error) {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    
-    // 既存のマイニング処理
+    // 注意: mineBlockWithDifficulty が内部で c.mu を取得するため、ここでロックしない
     block, err := c.mineBlockWithDifficulty(difficulty)
     if err != nil {
         return nil, err
@@ -435,6 +442,28 @@ case "receiveTransaction":
     
     // mempoolに追加
     if err := c.Mempool.Add(tx); err != nil {
+        return nil, rpcInvalidParams(err)
+    }
+    
+    return map[string]any{"status": "accepted"}, nil
+
+// receiveBlock（受信用）
+case "receiveBlock":
+    var block Block
+    if err := parseSingleObjectParam(params, &block); err != nil {
+        return nil, rpcInvalidParams(err)
+    }
+    
+    // 重要: 受信ブロックを無条件に信用してはいけない。最低限、
+    // - block.Hash がブロック内容から再計算した値と一致すること
+    // - PoW条件（Milestone 8）を満たすこと
+    // - 含まれる各txの署名が正しいこと
+    // - parentHash が既知のブロックを指すこと（未知なら同期するか保留）
+    // を検証してから取り込む。
+    // Milestone 9時点の importBlock は「headの直後（parentHash == head.Hash）に
+    // 繋がるブロックだけ受け入れ、それ以外は無視（またはchain syncで追いつく）」でよい。
+    // フォークを一般に扱う addBlockFromPeer への置き換えはMilestone 10で行う。
+    if err := c.importBlock(block); err != nil {
         return nil, rpcInvalidParams(err)
     }
     
@@ -535,10 +564,10 @@ func TestBlockBroadcast(t *testing.T) {
 ### 手動テスト
 ```bash
 # ターミナル1：ノード1起動
-go run . node --genesis genesis.json --datadir ./data1 --addr :8545
+go run ./cmd/minieth node --genesis genesis.json --datadir ./data1 --addr :8545
 
 # ターミナル2：ノード2起動
-go run . node --genesis genesis.json --datadir ./data2 --addr :8546
+go run ./cmd/minieth node --genesis genesis.json --datadir ./data2 --addr :8546
 
 # ターミナル3：ピア接続
 curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"admin_addPeer","params":["http://localhost:8546"],"id":1}'

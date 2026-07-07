@@ -47,26 +47,31 @@ func TestAddressConsistency(t *testing.T) {
 
 #### 実装例
 ```go
+// 注意: 実際の関数名は tx.VerfyAndNormalizeTx（Verifyのtypo。メソッドではなく
+// パッケージ関数）。テストを付けるこのタイミングで VerifyAndNormalizeTx への
+// リネームを推奨（以下はリネーム後の名前で書いている）。
 func TestValidSignature(t *testing.T) {
-    fromPriv, fromPub := generateKeyPair(t)
-    toPriv, _ := generateKeyPair(t)
+    fromPriv, _ := generateKeyPair(t)
+    _, toPub := generateKeyPair(t)
     
-    tx := createTransaction(t, fromPub, toPub, 100, 0)
-    signTransaction(t, fromPriv, &tx)
+    txn := createAndSignTransaction(t, fromPriv, account.AddressFromPubkey(toPub), 100, 0)
     
-    _, err := tx.VerifyAndNormalize()
+    _, err := tx.VerifyAndNormalizeTx(txn)
     assert.NoError(t, err)
 }
 
 func TestInvalidSignature(t *testing.T) {
-    fromPriv, fromPub := generateKeyPair(t)
-    toPriv, _ := generateKeyPair(t)
+    fromPriv, _ := generateKeyPair(t)
+    _, toPub := generateKeyPair(t)
     otherPriv, _ := generateKeyPair(t)
     
-    tx := createTransaction(t, fromPub, toPub, 100, 0)
-    signTransaction(t, otherPriv, &tx) // 間違った鍵で署名
+    txn := createAndSignTransaction(t, fromPriv, account.AddressFromPubkey(toPub), 100, 0)
     
-    _, err := tx.VerifyAndNormalize()
+    // 間違った鍵で署名し直す
+    sig := ed25519.Sign(otherPriv, tx.TxSignBytes(txn))
+    txn.Signature = "0x" + hex.EncodeToString(sig)
+    
+    _, err := tx.VerifyAndNormalizeTx(txn)
     assert.Error(t, err)
     assert.Contains(t, err.Error(), "invalid signature")
 }
@@ -196,6 +201,13 @@ func TestEthGetBalance(t *testing.T) {
 ### 共通ヘルパー関数
 **ファイル**: `internal/testutil/testutil.go`
 
+注意:
+
+- testifyは外部依存。`go get github.com/stretchr/testify` で追加する（現在のgo.modは依存ゼロ）
+- testutilは account / chain / rpc / tx に依存するため、これらのパッケージ内のテストから
+  testutilを使うと循環importになる。その場合はテストを `package tx_test` のような
+  external test packageにするか、testutilを使わずに書く
+
 ```go
 package testutil
 
@@ -205,13 +217,18 @@ import (
     "crypto/rand"
     "encoding/hex"
     "encoding/json"
-    "fmt"
     "net/http"
     "net/http/httptest"
+    "os"
+    "path/filepath"
     "testing"
-    "time"
 
     "github.com/stretchr/testify/require"
+
+    "like-a-ethereum/internal/account"
+    "like-a-ethereum/internal/chain"
+    "like-a-ethereum/internal/rpc"
+    "like-a-ethereum/internal/tx"
 )
 
 func GenerateKeyPair(t *testing.T) (ed25519.PrivateKey, ed25519.PublicKey) {
@@ -221,60 +238,45 @@ func GenerateKeyPair(t *testing.T) (ed25519.PrivateKey, ed25519.PublicKey) {
     return priv, pub
 }
 
-// SetupTestChain はgenesisファイルを使わず直接Chainを構築する
+// SetupTestChain は一時ディレクトリにgenesis.jsonを書き出し、
+// 公開API（chain.NewChainFromGenesis）だけでChainを構築する。
+// 非公開フィールド・非公開関数に依存しないため、内部リファクタリングに強い。
 func SetupTestChain(t *testing.T, balances map[string]uint64) *chain.Chain {
     t.Helper()
 
-    state := make(map[string]Account)
-    for addr, bal := range balances {
-        n, err := normalizeAddress(addr)
-        require.NoError(t, err)
-        state[n] = Account{Address: n, Balance: bal, Nonce: 0}
-    }
+    b, err := json.Marshal(map[string]any{"alloc": balances})
+    require.NoError(t, err)
 
-    c := &chain.Chain{
-        State:      state,
-        TxIndex:    make(map[string]TxLocation),
-        BlockIndex: make(map[string]uint64),
-    }
+    genesisPath := filepath.Join(t.TempDir(), "genesis.json")
+    require.NoError(t, os.WriteFile(genesisPath, b, 0o644))
 
-    genesis := Block{
-        Number:       0,
-        ParentHash:   "0x0000000000000000000000000000000000000000000000000000000000000000",
-        Timestamp:    time.Now().Unix(),
-        Transactions: []Transaction{},
-        StateRoot:    c.ComputeStateRoot(),
-    }
-    genesis.Hash = blockHash(genesis)
-    c.Blocks = []Block{genesis}
-    c.BlockIndex[genesis.Hash] = genesis.Number
-
+    c, err := chain.NewChainFromGenesis(genesisPath)
+    require.NoError(t, err)
     return c
 }
 
 // CreateAndSignTransaction はテスト用のトランザクションを作成・署名して返す
-func CreateAndSignTransaction(t *testing.T, priv ed25519.PrivateKey, to string, value, nonce uint64) Transaction {
+func CreateAndSignTransaction(t *testing.T, priv ed25519.PrivateKey, to string, value, nonce uint64) tx.Transaction {
     t.Helper()
 
     pub := priv.Public().(ed25519.PublicKey)
-    from := addressFromPubkey(pub)
 
-    toAddr, err := normalizeAddress(to)
+    toAddr, err := account.NormalizeAddress(to)
     require.NoError(t, err)
 
-    tx := Transaction{
-        From:   from,
+    txn := tx.Transaction{
+        From:   account.AddressFromPubkey(pub),
         To:     toAddr,
         Value:  value,
         Nonce:  nonce,
         PubKey: "0x" + hex.EncodeToString(pub),
     }
 
-    sig := ed25519.Sign(priv, txSignBytes(tx))
-    tx.Signature = "0x" + hex.EncodeToString(sig)
-    tx.Hash = txHash(tx)
+    sig := ed25519.Sign(priv, tx.TxSignBytes(txn))
+    txn.Signature = "0x" + hex.EncodeToString(sig)
+    txn.Hash = tx.TxHash(txn)
 
-    return tx
+    return txn
 }
 
 // CallRPC はhttptestサーバー経由でRPCメソッドを呼び出し、レスポンスをmap[string]anyで返す
@@ -299,9 +301,10 @@ func CallRPC(t *testing.T, server *httptest.Server, method string, params []any)
 }
 
 // SetupTestServer はChainからhttptestサーバーを起動して返す
+// （rpc.HandleRPC(c) は http.HandlerFunc を返す関数。Chainのメソッドではない）
 func SetupTestServer(t *testing.T, c *chain.Chain) *httptest.Server {
     t.Helper()
-    server := httptest.NewServer(http.HandlerFunc(c.HandleRPC))
+    server := httptest.NewServer(rpc.HandleRPC(c))
     t.Cleanup(server.Close)
     return server
 }
@@ -333,6 +336,17 @@ go tool cover -html=coverage.out
 ```bash
 go test -bench=. ./...
 ```
+
+## テスト整備と合わせて直す既知の問題
+
+milestone-0の「既知の問題」のうち、以下はこのマイルストーンで（先に現行動作をテストで固定した上で）直す:
+
+- `tx.VerfyAndNormalizeTx` のtypoを `VerifyAndNormalizeTx` にリネームする
+- `eth_getTransactionByHash` のレスポンスの `blockNumber` をhex quantityに統一する
+- `eth_getBlockByHash` のパラメータエラーメッセージ末尾のデバッグ文字列（`strconv.Itoa(len(arr))`）を除去する
+- 未知のhashで `result` フィールドごと省略される問題（`omitempty`）を直し、`"result": null` を返す
+  - 現状のままRPCテストに「resultがnull」を書くと、フィールド自体が存在せず期待とズレる点に注意
+- （推奨）genesisのTimestampを固定値にする。テストの再現性が上がり、遅くともMilestone 9までに必要になる
 
 ## 完了条件
 

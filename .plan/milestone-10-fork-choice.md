@@ -108,14 +108,15 @@ func (bt *BlockTree) AddBlock(block Block) error {
 func (bt *BlockTree) shouldUpdateHead(newNode *BlockNode) bool {
     current := bt.head
     
-    // 1. 高さで比較
-    if newNode.Height > current.Height {
+    // PoW導入後の本則は「total difficultyが最大のチェーン」。
+    // 全ブロックの難易度が同じなら、これは最長チェーンルールと一致する。
+    if newNode.TotalDiff > current.TotalDiff {
         return true
     }
     
-    // 2. 同じ高さの場合はTotal Difficultyで比較
-    if newNode.Height == current.Height {
-        return newNode.TotalDiff > current.TotalDiff
+    // Total Difficultyが同じ場合は高さで比較（それも同じなら既存headを維持=先着優先）
+    if newNode.TotalDiff == current.TotalDiff {
+        return newNode.Height > current.Height
     }
     
     return false
@@ -190,12 +191,18 @@ type Chain struct {
     persistence.Persistence
     p2p         *p2p.P2PManager
     blockTree   *BlockTree // 追加
-    genesisPath string     // 追加：rollbackState でGenesis再ロードに使用
+    genesisPath string     // 追加：rebuildStateFromCanonicalChain でGenesis再ロードに使用
 }
 
 func (c *Chain) addBlockFromPeer(block Block) error {
     c.mu.Lock()
     defer c.mu.Unlock()
+    
+    // 重要: ツリーに入れる前にブロック自体を検証する。
+    // これがないと、任意の偽ブロックを送りつけるだけでリオーグを起こせてしまう。
+    if err := c.validateBlock(block); err != nil {
+        return err
+    }
     
     // ブロックツリーに追加
     if err := c.blockTree.AddBlock(block); err != nil {
@@ -212,19 +219,16 @@ func (c *Chain) addBlockFromPeer(block Block) error {
 }
 
 func (c *Chain) reorgToNewHead() error {
-    // c.Blocks を渡して現在の正史との差分を計算
+    // 差分（捨てるブロック/新たに正史になるブロック）はログや、
+    // 捨てたブロック内のtxをmempoolへ戻す判断に使える
     oldBlocks, newBlocks := c.blockTree.ReorgToNewHead(c.Blocks)
+    log.Printf("reorg: discard %d blocks, adopt %d blocks", len(oldBlocks), len(newBlocks))
     
-    // 状態をロールバック
-    if err := c.rollbackState(oldBlocks); err != nil {
+    // 状態の再構築は rebuildStateFromCanonicalChain が「Genesis状態から
+    // 新しい正史の全ブロックを再適用」まで行う。
+    // 重要: ここでさらに newBlocks を個別に適用してはいけない（二重適用になる）。
+    if err := c.rebuildStateFromCanonicalChain(); err != nil {
         return err
-    }
-    
-    // 新しいブロックを適用
-    for _, block := range newBlocks {
-        if err := c.applyBlock(block); err != nil {
-            return err
-        }
     }
     
     // Blocks配列を更新
@@ -234,9 +238,9 @@ func (c *Chain) reorgToNewHead() error {
     return c.saveToDisk()
 }
 
-func (c *Chain) rollbackState(blocks []Block) error {
-    // 簡易実装：Genesisから再計算
-    // 本物ではより効率的なロールバックが必要
+func (c *Chain) rebuildStateFromCanonicalChain() error {
+    // 簡易実装：Genesisから正史全体を再計算
+    // 本物では共通祖先までの巻き戻し＋差分適用など、より効率的な方法が必要
     
     // Genesis状態にリセット（c.genesisPath は Chain 構造体のフィールド）
     genesis, err := NewChainFromGenesis(c.genesisPath)
@@ -258,6 +262,30 @@ func (c *Chain) rollbackState(blocks []Block) error {
         }
     }
     
+    return nil
+}
+
+// validateBlock は受信ブロックの最低限の検証を行う。
+func (c *Chain) validateBlock(block Block) error {
+    // 1. ハッシュ再計算が一致すること
+    if pow.CalculateHash(block) != block.Hash {
+        return errors.New("invalid block hash")
+    }
+    
+    // 2. PoW条件を満たすこと（Milestone 8）
+    if !pow.IsValidProof(block.Hash, block.Difficulty) {
+        return errors.New("invalid proof of work")
+    }
+    
+    // 3. 含まれる各txの署名が正しいこと
+    //（validateTransaction は tx.VerifyAndNormalizeTx を呼ぶ薄いラッパーとして実装する）
+    for _, tx := range block.Transactions {
+        if err := validateTransaction(tx); err != nil {
+            return fmt.Errorf("invalid tx in block: %w", err)
+        }
+    }
+    
+    // stateRootの妥当性は、リオーグ時に再適用した結果と突き合わせて確認する
     return nil
 }
 ```
@@ -301,6 +329,11 @@ case "getBlockByHash":
 ```
 
 ## テストケース
+
+注意: 以下の例では説明のために `block.Hash = "different_hash"` のようにハッシュを
+手書きしているが、これはBlockTree単体（検証を挟まない層）のテストに限る。
+`addBlockFromPeer` を通すテストでは、validateBlockのハッシュ再計算・PoWチェックを
+通過できるよう、テストヘルパーで実際に採掘したブロックを使うこと。
 
 ### 1. 基本的なフォーク処理
 ```go
@@ -454,9 +487,9 @@ func TestReorganization(t *testing.T) {
 ### 手動テスト
 ```bash
 # 3つのノードを起動
-go run . node --genesis genesis.json --datadir ./data1 --addr :8545 &
-go run . node --genesis genesis.json --datadir ./data2 --addr :8546 &
-go run . node --genesis genesis.json --datadir ./data3 --addr :8547 &
+go run ./cmd/minieth node --genesis genesis.json --datadir ./data1 --addr :8545 &
+go run ./cmd/minieth node --genesis genesis.json --datadir ./data2 --addr :8546 &
+go run ./cmd/minieth node --genesis genesis.json --datadir ./data3 --addr :8547 &
 
 # ピア接続
 curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"admin_addPeer","params":["http://localhost:8546"],"id":1}'
@@ -474,12 +507,12 @@ curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"getForkStatus","pa
 - リオーグが正しく動作する
 
 ## 次のステップ
-Fork Choiceが実装できたら、Milestone 11でGas風の仕組みを実装します。これにより、トランザクション手数料の概念を学べます。
+Fork Choiceが実装できたら、Milestone 11でQBFTコンセンサスを実装します。PoW＋最長チェーンルール（確率的ファイナリティ）を体験した後にQBFT（即時ファイナリティ）へ進むことで、「なぜQBFTではフォークもリオーグも起きないのか」を対比で学べます。
 
 ## 注意点
 この実装は簡易的なFork Choiceです：
 
-- 本物のEthereum：GHOST协议、Uncleブロック考慮
+- 本物のEthereum：GHOSTプロトコル、Uncleブロック考慮
 - この実装：単純な最長チェーンルール
 - 本物：複雑なリオーグ最適化
 - この実装：単純な全状態再計算

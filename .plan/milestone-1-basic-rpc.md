@@ -1,4 +1,4 @@
-# Milestone 1: 基本RPCの拡充
+# Milestone 1: 基本RPCの拡充（完了）
 
 ## 概要
 現在のJSON-RPC APIを拡張して、Ethereum互換の基本的なクエリ機能を追加します。

@@ -129,9 +129,8 @@ func (m *Mempool) validateTransaction(tx Transaction) error {
         return errors.New("invalid from/to address")
     }
     
-    if tx.Value == 0 {
-        return errors.New("zero value transaction")
-    }
+    // 注意: value=0 のトランザクションはEthereumでは有効（コントラクト呼び出し等で普通に使う）。
+    // ここでは拒否しない。
     
     // 署名検証はChainレベルで行う
     return nil
@@ -173,7 +172,7 @@ func (m *Mempool) Clear()
 
 ### 2. トランザクションの検証ルール
 mempool追加時の検証項目：
-- 署名の妥当性
+- 署名の妥当性（sendTransactionの入口で `tx.VerifyAndNormalizeTx` により検証・正規化済み）
 - nonceの妥当性（現在のアカウントnonce以上）
 - 残高不足チェック（オプション：mempool段階ではチェックしない選択も）
 
@@ -188,19 +187,26 @@ mempool内でのトランザクション順序：
 #### sendTransactionの変更
 ```go
 case "sendTransaction":
-    var tx Transaction
-    if err := parseSingleObjectParam(params, &tx); err != nil {
+    var t tx.Transaction
+    if err := parseSingleObjectParam(params, &t); err != nil {
         return nil, rpcInvalidParams(err)
     }
     
-    // 検証のみで、mempoolに追加
-    if err := c.mempool.Add(tx); err != nil {
+    // 入口で署名検証と正規化を済ませる（Hashもここで確定する）。
+    // これを飛ばすと未検証・Hash未設定のtxがmempoolに入ってしまう。
+    // nonce・残高は状態が変わりうるので採掘時にも再チェックする。
+    verified, err := tx.VerifyAndNormalizeTx(t)
+    if err != nil {
+        return nil, rpcInvalidParams(err)
+    }
+    
+    if err := c.Mempool.Add(verified); err != nil {
         return nil, rpcInvalidParams(err)
     }
     
     return map[string]any{
-        "transactionHash": tx.Hash,
-        "status": "pending",
+        "transactionHash": verified.Hash,
+        "status":          "pending",
     }, nil
 ```
 
@@ -266,11 +272,19 @@ func (c *Chain) mineBlock() (*Block, error) {
     }
     
     // 状態遷移処理（既存ロジックを流用）
+    // 重要: 失敗したtxをブロックに含めてはいけない。
+    // ブロックには実際に状態遷移が成功したtxだけを入れる。
+    var appliedTxs []Transaction
     for _, tx := range txs {
         if err := c.applyTransaction(tx); err != nil {
             // 失敗したトランザクションは破棄
             continue
         }
+        appliedTxs = append(appliedTxs, tx)
+    }
+    
+    if len(appliedTxs) == 0 {
+        return nil, errors.New("no valid transactions")
     }
     
     // ブロック生成
@@ -278,7 +292,7 @@ func (c *Chain) mineBlock() (*Block, error) {
         Number:       c.Blocks[len(c.Blocks)-1].Number + 1,
         ParentHash:   c.Blocks[len(c.Blocks)-1].Hash,
         Timestamp:    time.Now().Unix(),
-        Transactions: txs,
+        Transactions: appliedTxs,
         StateRoot:    c.computeStateRootLocked(),
     }
     
@@ -308,6 +322,12 @@ func (c *Chain) mineBlock() (*Block, error) {
 ### 4. mempoolのサイズ制限
 - 最大1000件などの制限を設ける
 - 古いトランザクションから削除する
+
+### 5. Milestone 5との役割分担
+このマイルストーンの範囲は「mempoolを介したブロック生成フロー」の導入まで。
+上の `mineBlock` は `c.State` に直接適用する簡易版であり、
+nonce順のソート・一時stateへの適用（途中失敗時のロールバック）・
+失敗txをmempoolに残す扱いは、Milestone 5で整備する。
 
 ## テストケース
 
@@ -378,7 +398,7 @@ func TestMempoolErrors(t *testing.T) {
 ### 手動テスト
 ```bash
 # 1. ノード起動
-go run . node --genesis genesis.json --addr :8545
+go run ./cmd/minieth node --genesis genesis.json --addr :8545
 
 # 2. トランザクション送信（ブロックは増えない）
 curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"sendTransaction","params":[...],"id":1}'

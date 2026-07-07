@@ -3,9 +3,11 @@
 ## 概要
 現在の実装では1トランザクション＝1ブロックですが、実際のEthereumでは1ブロックに複数のトランザクションが含まれます。この機能を実装し、ブロック内でのトランザクション処理順序や状態管理を学びます。
 
-## 現在の制約
-- 1ブロックに1トランザクションのみ
-- `mineBlock` が最大10件のトランザクションを処理するが、実際には1件しか処理していない
+## 現在の制約（Milestone 4完了時点）
+- `mineBlock` は複数txを取り出せるが、mempoolから取り出した順に直接 `c.State` へ適用する
+- 同一送信元のトランザクションのnonce順が保証されない（nonce順に届かないと失敗する）
+- 途中で失敗したtxはロールバックされず、mempoolにも残らず破棄される
+- ブロック生成用の一時state管理がない
 
 ## 目標
 - 1ブロックに複数トランザクションを含める
@@ -93,57 +95,18 @@ func (c *Chain) applyTransactionToState(state map[string]Account, tx Transaction
 }
 ```
 
-### 3. トランザクションソートと選別ロジック
-```go
-// 適用可能なトランザクションを選別
-func (c *Chain) selectApplicableTransactions(state map[string]Account, txs []Transaction) []Transaction {
-    sort.Sort(TransactionSorter(txs))
-    
-    var applicable []Transaction
-    processedNonces := make(map[string]uint64) // from -> next nonce
-    
-    for _, tx := range txs {
-        from := state[tx.From]
-        if from.Address == "" {
-            continue // 送信元アカウントが存在しない
-        }
-        
-        expectedNonce := processedNonces[tx.From]
-        if tx.Nonce != expectedNonce {
-            continue // nonceが期待値と異なる
-        }
-        
-        // 残高チェック
-        if from.Balance < tx.Value {
-            continue // 残高不足
-        }
-        
-        // このトランザクションは適用可能
-        applicable = append(applicable, tx)
-        
-        // 状態を更新して次のトランザクションチェックに備える
-        from.Balance -= tx.Value
-        from.Nonce++
-        state[tx.From] = from
-        
-        // 宛先アカウントを準備
-        to := state[tx.To]
-        if to.Address == "" {
-            to = Account{
-                Address: tx.To,
-                Balance: 0,
-                Nonce:   0,
-            }
-        }
-        to.Balance += tx.Value
-        state[tx.To] = to
-        
-        processedNonces[tx.From] = expectedNonce + 1
-    }
-    
-    return applicable
-}
-```
+### 3. トランザクションの選別
+
+「適用可能なtxの選別」は専用のロジックを持たず、次の手順で自然に実現する:
+
+1. `TransactionSorter` で (From, Nonce) 順にソートする
+2. コピーした一時state（tempState）に対して `applyTransactionToState` を順に試す
+3. 失敗したtx（nonce不一致・残高不足など）はスキップする
+
+nonceの期待値は、適用のたびに tempState 内の `from.Nonce` が進むことで自動的に
+追跡される。`processedNonces` のような別の追跡mapを持つ設計にすると、
+「既存アカウントの現在nonce」との初期化ずれ（0始まりにしてしまう等）でバグりやすい。
+状態そのものを唯一の真実として使うこと。
 
 ### 4. ブロック生成ロジックの改善
 ```go
@@ -203,7 +166,7 @@ func (c *Chain) mineBlock() (*Block, error) {
 }
 ```
 
-### 4. Mempoolの改善
+### 5. Mempoolの改善
 ```go
 func (m *Mempool) Remove(hash string) bool {
     m.mu.Lock()

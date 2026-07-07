@@ -238,38 +238,52 @@ func (c *Chain) mineBlockWithDifficulty(difficulty uint64) (*Block, error) {
     c.mu.Lock()
     defer c.mu.Unlock()
     
-    // mempoolからトランザクションを取得
-    txs := c.Mempool.Take(10)
-    if len(txs) == 0 {
+    // mempoolからトランザクションを取得（Takeせず、成功した分だけ後で削除する）
+    allTxs := c.Mempool.GetAll()
+    if len(allTxs) == 0 {
         return nil, errors.New("no transactions in mempool")
     }
     
-    // ブロックの雛形を作成
+    // Milestone 5と同じ流れ: 一時stateに適用し、成功したtxだけをブロックに入れる
+    sort.Sort(TransactionSorter(allTxs))
+    tempState := c.copyState()
+    
+    var appliedTxs []Transaction
+    for _, tx := range allTxs {
+        if err := c.applyTransactionToState(tempState, tx); err != nil {
+            continue
+        }
+        appliedTxs = append(appliedTxs, tx)
+    }
+    
+    if len(appliedTxs) == 0 {
+        return nil, errors.New("no valid transactions")
+    }
+    
+    // 重要: StateRootは「txを適用した後のstate」から計算する。
+    // 適用前のc.Stateから計算すると、ブロックのStateRootが遷移前の状態を指してしまう。
     block := Block{
         Number:       c.Blocks[len(c.Blocks)-1].Number + 1,
         ParentHash:   c.Blocks[len(c.Blocks)-1].Hash,
         Timestamp:    time.Now().Unix(),
         Nonce:        0,
         Difficulty:   difficulty,
-        Transactions: txs,
-        StateRoot:    c.computeStateRootLocked(),
+        Transactions: appliedTxs,
+        StateRoot:    computeStateRootOf(tempState),
     }
     
-    // マイニング実行
+    // マイニング実行（失敗した場合はtempStateを破棄するだけで済む）
     minedBlock, err := pow.MineBlock(block, 1000000) // 最大100万回試行
     if err != nil {
         return nil, err
     }
     
-    // 状態遷移
-    for _, tx := range txs {
-        if err := c.applyTransaction(tx); err != nil {
-            continue
-        }
+    // マイニング成功後に状態をマージし、成功したtxだけmempoolから削除
+    //（Milestone 5の方針どおり、失敗txはmempoolに残す。Clear()で全消ししない）
+    c.State = tempState
+    for _, tx := range appliedTxs {
+        c.Mempool.Remove(tx.Hash)
     }
-    
-    // mempoolをクリア
-    c.Mempool.Clear()
     
     // ブロックを追加
     c.Blocks = append(c.Blocks, minedBlock)
@@ -280,6 +294,37 @@ func (c *Chain) mineBlockWithDifficulty(difficulty uint64) (*Block, error) {
     }
     
     return &minedBlock, nil
+}
+
+// computeStateRootOf は任意のstateからstateRootを計算する。
+// 既存の computeStateRootLocked は c.State 固定なので、
+// 「一時stateからStateRootを計算し、マイニング成功後にマージする」流れに
+// 合わせて、引数でstateを受ける形に共通化する（このマイルストーンで導入）。
+func computeStateRootOf(state map[string]Account) string {
+    // 注意: Milestone 6以降、stateRootはMerkle root（merkletreeパッケージ）で計算する。
+    // ソート済みJSONのSHA-256（Milestone 5以前の方式）に戻さないこと。
+    keys := make([]string, 0, len(state))
+    for k := range state {
+        keys = append(keys, k)
+    }
+    sort.Strings(keys)
+    
+    leaves := make([]merkletree.StateLeaf, 0, len(keys))
+    for _, k := range keys {
+        a := state[k]
+        leaves = append(leaves, merkletree.StateLeaf{
+            Address: a.Address,
+            Balance: a.Balance,
+            Nonce:   a.Nonce,
+        })
+    }
+    
+    return merkletree.NewMerkleTree(leaves).Root.Hash
+}
+
+// 既存メソッドはラッパーにする
+func (c *Chain) computeStateRootLocked() string {
+    return computeStateRootOf(c.State)
 }
 ```
 
@@ -523,3 +568,8 @@ go test ./internal/chain -run TestPoW
 - この実装：簡易的な難易度調整
 
 あくまでPoWの基本概念を学ぶための実装です。
+
+また、上の `mineBlockWithDifficulty` はマイニング中も `c.mu` を保持し続けるため、
+その間すべてのRPCがブロックされます。学習用としては許容範囲ですが、本来は
+ロック外でマイニングし、完了後に再度ロックを取って（親ブロックが変わっていないか
+確認した上で）チェーンに取り込む設計にします。

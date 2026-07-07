@@ -1,4 +1,4 @@
-# Milestone 13: Ethereum形式への接近
+# Milestone 14: Ethereum形式への接近
 
 ## 概要
 これまでの実装は学習用に簡略化されてきましたが、この最終マイルストーンでは、本物のEthereumに少しずつ近づけていきます。完全な互換性を目指すのではなく、本物の仕様との差分を理解し、段階的に置き換えていくことを目的とします。
@@ -256,9 +256,11 @@ func (tx *Transaction) SignWithChainID(privKey *ecdsa.PrivateKey, chainID uint64
         return err
     }
     
-    // VにchainIDを含める
-    tx.V = uint64(chainID)*2 + 35 + 27 // 簡略化
-    // R, Sを設定
+    // VにchainIDを含める（EIP-155: v = chainId*2 + 35 + recoveryId、recoveryIdは0か1）
+    // 注意: +27を足すのはlegacy署名（chainIDなし）の場合のみ。EIP-155では足さない。
+    recoveryID := uint64(signature[64])
+    tx.V = chainID*2 + 35 + recoveryID
+    // R, Sは signature[:32], signature[32:64] から設定
     
     return nil
 }
@@ -419,7 +421,7 @@ func TestRLPEncoding(t *testing.T) {
 ### Phase 3: トランザクション形式
 1. RLPエンコーディングを実装
 2. eth_sendRawTransactionを追加
-3.段階的な移行
+3. 段階的な移行
 
 ### Phase 4: その他の互換性
 1. ChainIdを導入
@@ -431,10 +433,10 @@ func TestRLPEncoding(t *testing.T) {
 ### 手動テスト
 ```bash
 # Keccak-256モードで起動
-go run . node --genesis genesis.json --keccak --secp256k1 --rlp --addr :8545
+go run ./cmd/minieth node --genesis genesis.json --keccak --secp256k1 --rlp --addr :8545
 
 # secp256k1キーを生成
-go run . account --secp256k1
+go run ./cmd/minieth account --secp256k1
 
 # Rawトランザクションを送信
 curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0x..."],"id":1}'
@@ -464,6 +466,7 @@ curl -s -X POST localhost:8545 -d '{"jsonrpc":"2.0","method":"eth_blockNumber","
 - P2P通信
 - フォークとFork Choice
 - 簡易PoW
+- QBFT（BFT合意と即時ファイナリティ）
 - マイニングと報酬
 
 ✅ **高度な概念**
